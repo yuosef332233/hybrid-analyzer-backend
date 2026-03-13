@@ -50,18 +50,23 @@ SFI_LEAGUE_MAP = {
     88: "7",
 }
 
-# ── SportMonks league IDs ──
+# ── SportMonks league IDs (verified) ──
 SM_LEAGUE_MAP = {
-    39: 8,       # Premier League
-    140: 564,    # La Liga
-    135: 384,    # Serie A
-    78: 82,      # Bundesliga
-    61: 301,     # Ligue 1
-    2: 2,        # Champions League
-    3: 5,        # Europa League
-    848: 1298,   # Conference League
-    94: 182,     # Primeira Liga
-    88: 72,      # Eredivisie
+    39: 8,
+    140: 564,
+    135: 384,
+    78: 82,
+    61: 301,
+    2: 2,
+    3: 5,
+    848: 2286,
+}
+
+# ── SportMonks current season IDs (verified) ──
+SM_SEASON_MAP = {
+    2: 25580,    # Champions League 2025/26
+    3: 25582,    # Europa League 2025/26
+    848: 25581,  # Conference League 2025/26
 }
 
 # ── football-data.org → our league_id ──
@@ -84,24 +89,21 @@ API_TO_OUR = {
 # ══════════════════════════════════════════
 
 async def _get_teams_sportmonks(league_id: int, season: int) -> list:
-    """Get teams from SportMonks API"""
-    sm_league = SM_LEAGUE_MAP.get(league_id)
-    if not sm_league or not SM_KEY:
+    """Get teams from SportMonks API using season endpoint"""
+    if not SM_KEY:
+        return []
+    season_id = SM_SEASON_MAP.get(league_id)
+    if not season_id:
         return []
     try:
         async with httpx.AsyncClient(timeout=15) as client:
             r = await client.get(
-                f"{SM_URL}/teams",
-                params={
-                    "api_token": SM_KEY,
-                    "filters": f"leagueId:{sm_league}",
-                    "per_page": 50,
-                },
+                f"{SM_URL}/teams/seasons/{season_id}",
+                params={"api_token": SM_KEY, "per_page": 50},
             )
             if r.status_code == 200:
-                data = r.json()
                 teams = []
-                for t in data.get("data", []):
+                for t in r.json().get("data", []):
                     name = t.get("name") or t.get("short_code", "")
                     if t.get("id") and name:
                         teams.append({
