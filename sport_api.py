@@ -9,21 +9,19 @@ API_KEY = os.getenv("FOOTBALL_API_KEY")
 BASE_URL = "https://api.football-data.org/v4"
 HEADERS = {"X-Auth-Token": API_KEY}
 
-# football-data.org competition codes
 LEAGUE_MAP = {
-    39: "PL",    # Premier League
-    140: "PD",   # La Liga
-    135: "SA",   # Serie A
-    78: "BL1",   # Bundesliga
-    61: "FL1",   # Ligue 1
-    2: "CL",     # Champions League
-    3: "EL",     # Europa League
-    848: "ECL",  # Conference League
-    94: "PPL",   # Primeira Liga
-    88: "DED",   # Eredivisie
+    39: "PL",
+    140: "PD",
+    135: "SA",
+    78: "BL1",
+    61: "FL1",
+    2: "CL",
+    3: "EL",
+    848: "ECL",
+    94: "PPL",
+    88: "DED",
 }
 
-# Fallback team IDs for Europa & Conference League (common clubs)
 EUROPA_TEAMS = {
     "Manchester United": 66, "Roma": 100, "Lazio": 98, "Bayer Leverkusen": 3,
     "Atalanta": 102, "Lyon": 80, "Porto": 211, "Benfica": 211,
@@ -45,7 +43,6 @@ CONFERENCE_TEAMS = {
 async def get_teams(league_id: int, season: int) -> list:
     code = LEAGUE_MAP.get(league_id)
 
-    # For Conference League — use manual list + search
     if league_id == 848:
         teams = []
         seen = set()
@@ -53,7 +50,6 @@ async def get_teams(league_id: int, season: int) -> list:
             if tid not in seen:
                 teams.append({"id": tid, "name": name})
                 seen.add(tid)
-        # Also try API
         try:
             async with httpx.AsyncClient() as client:
                 r = await client.get(
@@ -70,7 +66,6 @@ async def get_teams(league_id: int, season: int) -> list:
             pass
         return teams
 
-    # For Europa League — combine API + manual
     if league_id == 3:
         teams = []
         seen = set()
@@ -88,7 +83,6 @@ async def get_teams(league_id: int, season: int) -> list:
                             seen.add(t["id"])
         except Exception:
             pass
-        # Add manual fallback
         for name, tid in EUROPA_TEAMS.items():
             if tid not in seen:
                 teams.append({"id": tid, "name": name})
@@ -155,11 +149,14 @@ async def get_team_stats(team_id: int, league_id: int, season: int) -> dict:
             goals_for += gf
             goals_against += ga
             if gf > ga:
-                wins += 1; form.append("W")
+                wins += 1
+                form.append("W")
             elif gf == ga:
-                draws += 1; form.append("D")
+                draws += 1
+                form.append("D")
             else:
-                losses += 1; form.append("L")
+                losses += 1
+                form.append("L")
 
         played = wins + draws + losses
         return {
@@ -210,64 +207,61 @@ async def get_h2h(team1_id: int, team2_id: int, last: int = 10) -> list:
     return h2h[:last]
 
 
-async with httpx.AsyncClient(timeout=30) as client: 
+async def get_todays_matches() -> list:
     """Fetch all matches scheduled for today across all supported leagues"""
     today = date.today().isoformat()
     all_matches = []
     seen_ids = set()
 
-    async with httpx.AsyncClient() as client:
-        # Fetch all matches today from API
-        r = await client.get(
-            f"{BASE_URL}/matches",
-            headers=HEADERS,
-            params={"dateFrom": today, "dateTo": today},
-            timeout=15
-        )
-        if r.status_code == 200:
-            data = r.json()
-            for m in data.get("matches", []):
-                mid = m.get("id")
-                if mid in seen_ids:
-                    continue
-                seen_ids.add(mid)
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            r = await client.get(
+                f"{BASE_URL}/matches",
+                headers=HEADERS,
+                params={"dateFrom": today, "dateTo": today},
+            )
+            if r.status_code == 200:
+                data = r.json()
+                for m in data.get("matches", []):
+                    mid = m.get("id")
+                    if mid in seen_ids:
+                        continue
+                    seen_ids.add(mid)
 
-                competition = m.get("competition", {})
-                league_id = competition.get("id", 0)
+                    competition = m.get("competition", {})
+                    league_id = competition.get("id", 0)
 
-                # Map API competition ID to our league_id
-                api_to_our = {
-                    2021: 39,   # PL
-                    2014: 140,  # La Liga
-                    2019: 135,  # Serie A
-                    2002: 78,   # Bundesliga
-                    2015: 61,   # Ligue 1
-                    2001: 2,    # CL
-                    2146: 3,    # EL
-                    2148: 848,  # ECL
-                    2017: 94,   # PPL
-                    2003: 88,   # Eredivisie
-                }
-                our_league_id = api_to_our.get(league_id, league_id)
+                    api_to_our = {
+                        2021: 39,
+                        2014: 140,
+                        2019: 135,
+                        2002: 78,
+                        2015: 61,
+                        2001: 2,
+                        2146: 3,
+                        2154: 848,
+                        2017: 94,
+                        2003: 88,
+                    }
+                    our_league_id = api_to_our.get(league_id, league_id)
 
-                all_matches.append({
-                    "match_id": mid,
-                    "home_team": {
-                        "id": m["homeTeam"]["id"],
-                        "name": m["homeTeam"]["name"],
-                    },
-                    "away_team": {
-                        "id": m["awayTeam"]["id"],
-                        "name": m["awayTeam"]["name"],
-                    },
-                    "league_id": our_league_id,
-                    "league_name": competition.get("name", ""),
-                    "kickoff": m.get("utcDate", ""),
-                    "status": m.get("status", "SCHEDULED"),
-                    "score": {
-                        "home": m["score"]["fullTime"]["home"],
-                        "away": m["score"]["fullTime"]["away"],
-                    } if m.get("score") else None
-                })
+                    all_matches.append({
+                        "match_id": mid,
+                        "home_team": {
+                            "id": m["homeTeam"]["id"],
+                            "name": m["homeTeam"]["name"],
+                        },
+                        "away_team": {
+                            "id": m["awayTeam"]["id"],
+                            "name": m["awayTeam"]["name"],
+                        },
+                        "league_id": our_league_id,
+                        "league_name": competition.get("name", ""),
+                        "kickoff": m.get("utcDate", ""),
+                        "status": m.get("status", "SCHEDULED"),
+                        "score": None,
+                    })
+    except Exception:
+        pass
 
     return all_matches
