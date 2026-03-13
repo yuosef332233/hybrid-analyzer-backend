@@ -12,7 +12,6 @@ def compute_rating(stats: dict) -> float:
     return round(min(95, max(40, rating)), 1)
 
 def auto_context(stats: dict, team_name: str, is_home: bool) -> dict:
-    """Auto-generate context factors from real stats"""
     if not stats:
         return {"mod": 0, "factors": []}
 
@@ -25,12 +24,10 @@ def auto_context(stats: dict, team_name: str, is_home: bool) -> dict:
     mod = 0
     factors = []
 
-    # Home advantage
     if is_home:
         mod += 5
         factors.append({"icon": "🏟️", "label": "Home ground advantage", "impact": 5, "type": "positive"})
 
-    # Form analysis
     recent = form[-5:] if len(form) >= 5 else form
     win_count = recent.count("W")
     loss_count = recent.count("L")
@@ -48,7 +45,6 @@ def auto_context(stats: dict, team_name: str, is_home: bool) -> dict:
         mod -= 7
         factors.append({"icon": "⚠️", "label": f"Struggling — {loss_count} losses in last 5", "impact": -7, "type": "negative"})
 
-    # Consecutive wins/losses
     if len(form) >= 3:
         last3 = form[-3:]
         if all(r == "W" for r in last3):
@@ -58,7 +54,6 @@ def auto_context(stats: dict, team_name: str, is_home: bool) -> dict:
             mod -= 5
             factors.append({"icon": "💔", "label": "3-game losing streak", "impact": -5, "type": "negative"})
 
-    # Attack strength
     if gf >= 2.5:
         mod += 8
         factors.append({"icon": "⚽", "label": f"Clinical attack — {gf} goals/game avg", "impact": 8, "type": "positive"})
@@ -69,7 +64,6 @@ def auto_context(stats: dict, team_name: str, is_home: bool) -> dict:
         mod -= 6
         factors.append({"icon": "😶", "label": f"Weak attack — {gf} goals/game avg", "impact": -6, "type": "negative"})
 
-    # Defense
     if ga <= 0.8:
         mod += 7
         factors.append({"icon": "🛡️", "label": f"Solid defense — {ga} goals conceded avg", "impact": 7, "type": "positive"})
@@ -81,6 +75,7 @@ def auto_context(stats: dict, team_name: str, is_home: bool) -> dict:
         factors.append({"icon": "😬", "label": f"Vulnerable defense — {ga} goals conceded avg", "impact": -3, "type": "negative"})
 
     return {"mod": mod, "factors": factors}
+
 
 def run_analysis(home_stats, away_stats, h2h_fixtures,
                  home_team_id: int,
@@ -97,14 +92,12 @@ def run_analysis(home_stats, away_stats, h2h_fixtures,
     home_momentum = form_to_score(home_form)
     away_momentum = form_to_score(away_form)
 
-    # Auto context from real stats
     home_ctx = auto_context(home_stats, "home", is_home=True)
     away_ctx = auto_context(away_stats, "away", is_home=False)
 
     home_ctx_mod = home_ctx["mod"]
     away_ctx_mod = away_ctx["mod"]
 
-    # Weighted score: 45% rating + 35% momentum + 20% context
     home_score = (home_rating * 0.45) + (home_momentum * 0.35) + home_ctx_mod
     away_score = (away_rating * 0.45) + (away_momentum * 0.35) + away_ctx_mod
 
@@ -160,4 +153,100 @@ def run_analysis(home_stats, away_stats, h2h_fixtures,
         "predicted_home_goals": home_goals,
         "predicted_away_goals": away_goals,
         "context_factors": context_factors,
+    }
+
+
+def build_recommendations(predictions: list) -> dict:
+    """
+    Build two recommendation lists from today's predictions:
+    1. solid_picks — top 5 most confident predictions
+    2. value_picks — top 5 'against the tide' (underdog likely to win)
+    """
+    if not predictions:
+        return {"solid_picks": [], "value_picks": []}
+
+    # ── Solid picks: high confidence + clear winner ──
+    solid = []
+    for p in predictions:
+        conf = p.get("confidence", 0)
+        hw = p.get("home_win_prob", 0)
+        aw = p.get("away_win_prob", 0)
+        dw = p.get("draw_prob", 0)
+
+        max_prob = max(hw, aw, dw)
+        if conf >= 65 and max_prob >= 50:
+            if hw == max_prob:
+                pick = p["home_team"]
+                outcome = "Win"
+                prob = hw
+            elif aw == max_prob:
+                pick = p["away_team"]
+                outcome = "Win"
+                prob = aw
+            else:
+                pick = "Draw"
+                outcome = "Draw"
+                prob = dw
+
+            solid.append({
+                "match": f"{p['home_team']} vs {p['away_team']}",
+                "league": p.get("league", ""),
+                "pick": pick,
+                "outcome": outcome,
+                "probability": prob,
+                "confidence": conf,
+                "kickoff": p.get("kickoff", ""),
+                "predicted_score": p.get("predicted_score", ""),
+            })
+
+    # Sort by confidence desc, take top 5
+    solid = sorted(solid, key=lambda x: x["confidence"], reverse=True)[:5]
+
+    # ── Value picks: underdog has higher AI probability than expected ──
+    # "Against the tide" = away team wins but home_win_prob > away_win_prob
+    # OR home_win_prob is low but AI still picks home
+    value = []
+    for p in predictions:
+        hw = p.get("home_win_prob", 0)
+        aw = p.get("away_win_prob", 0)
+        conf = p.get("confidence", 0)
+
+        # Away underdog: away_win_prob surprisingly high (>=35%) but lower than home
+        if aw >= 35 and hw > aw and conf >= 55:
+            gap = hw - aw
+            if gap <= 20:  # Close gap = real upset potential
+                value.append({
+                    "match": f"{p['home_team']} vs {p['away_team']}",
+                    "league": p.get("league", ""),
+                    "pick": p["away_team"],
+                    "outcome": "Upset Win",
+                    "probability": aw,
+                    "confidence": conf,
+                    "kickoff": p.get("kickoff", ""),
+                    "reason": f"AI gives {p['away_team']} {aw}% despite being away — gap only {gap}%",
+                    "predicted_score": p.get("predicted_score", ""),
+                })
+
+        # Home underdog: home team has surprisingly low prob but AI still sees value
+        elif hw >= 30 and aw > hw and conf >= 55:
+            gap = aw - hw
+            if gap <= 18:
+                value.append({
+                    "match": f"{p['home_team']} vs {p['away_team']}",
+                    "league": p.get("league", ""),
+                    "pick": p["home_team"],
+                    "outcome": "Home Upset",
+                    "probability": hw,
+                    "confidence": conf,
+                    "kickoff": p.get("kickoff", ""),
+                    "reason": f"AI gives {p['home_team']} {hw}% at home despite being underdogs — gap only {gap}%",
+                    "predicted_score": p.get("predicted_score", ""),
+                })
+
+    # Sort by probability desc, take top 5
+    value = sorted(value, key=lambda x: x["probability"], reverse=True)[:5]
+
+    return {
+        "solid_picks": solid,
+        "value_picks": value,
     }
