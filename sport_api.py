@@ -210,7 +210,7 @@ async def get_h2h(team1_id: int, team2_id: int, last: int = 10) -> list:
     return h2h[:last]
 
 
-async def get_todays_matches() -> list:
+async with httpx.AsyncClient(timeout=30) as client: -> list:
     """Fetch all matches scheduled for today across all supported leagues"""
     today = date.today().isoformat()
     all_matches = []
