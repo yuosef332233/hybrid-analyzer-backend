@@ -1,16 +1,16 @@
 import traceback
-import json
-import os
 import asyncio
-from datetime import date, datetime
+import os
+from datetime import date, datetime, timedelta
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional
 import sport_api
 import analyzer
+import db
 
-app = FastAPI(title="Hybrid Intelligence Analyzer API", version="2.0.0")
+app = FastAPI(title="Hybrid Intelligence Analyzer API", version="3.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -18,19 +18,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-# ─── Simple file-based storage (no DB needed) ───
-PREDICTIONS_FILE = "predictions_store.json"
-
-def load_predictions() -> dict:
-    if os.path.exists(PREDICTIONS_FILE):
-        with open(PREDICTIONS_FILE, "r") as f:
-            return json.load(f)
-    return {}
-
-def save_predictions(data: dict):
-    with open(PREDICTIONS_FILE, "w") as f:
-        json.dump(data, f, indent=2)
 
 
 # ─── Models ───
@@ -48,10 +35,81 @@ class UpdateResultRequest(BaseModel):
     actual_away_goals: int
 
 
-# ─── Existing endpoints ───
+# ─── Auto accuracy updater ───
+async def auto_update_accuracy():
+    """Runs every night at 23:00 UTC — fetches real results and updates accuracy"""
+    while True:
+        now = datetime.utcnow()
+        # Target: 23:00 UTC
+        target = now.replace(hour=23, minute=0, second=0, microsecond=0)
+        if now >= target:
+            target += timedelta(days=1)
+        wait_seconds = (target - now).total_seconds()
+        await asyncio.sleep(wait_seconds)
+
+        try:
+            today = date.today().isoformat()
+            predictions = db.get_predictions(today)
+            if not predictions:
+                continue
+
+            finished = await sport_api.get_finished_matches(today)
+            finished_map = {f["match_id"]: f for f in finished}
+
+            updated = False
+            for p in predictions:
+                if p["correct"] is not None:
+                    continue  # already updated
+                result = finished_map.get(p["match_id"])
+                if not result:
+                    continue
+
+                hg = result["home_goals"]
+                ag = result["away_goals"]
+                actual_result = f"{hg}-{ag}"
+
+                if hg > ag:
+                    actual_outcome = "home"
+                elif ag > hg:
+                    actual_outcome = "away"
+                else:
+                    actual_outcome = "draw"
+
+                hw = p["home_win_prob"]
+                aw = p["away_win_prob"]
+                dw = p["draw_prob"]
+                if hw >= aw and hw >= dw:
+                    predicted_outcome = "home"
+                elif aw >= hw and aw >= dw:
+                    predicted_outcome = "away"
+                else:
+                    predicted_outcome = "draw"
+
+                correct = (actual_outcome == predicted_outcome)
+                db.update_match_result(p["match_id"], today, actual_result, correct)
+                updated = True
+
+            if updated:
+                db.recalculate_accuracy(today)
+
+        except Exception:
+            pass
+
+
+@app.on_event("startup")
+async def startup():
+    db.init_db()
+    asyncio.create_task(auto_update_accuracy())
+
+
+# ══════════════════════════════════════════
+#  ENDPOINTS
+# ══════════════════════════════════════════
+
 @app.get("/")
 def root():
-    return {"status": "Hybrid Intelligence Analyzer API is running ✅ v2.0"}
+    return {"status": "Hybrid Intelligence Analyzer API is running ✅ v3.0"}
+
 
 @app.get("/teams")
 async def get_teams(league_id: int, season: int = 2024):
@@ -61,6 +119,7 @@ async def get_teams(league_id: int, season: int = 2024):
     except Exception:
         raise HTTPException(status_code=500, detail=traceback.format_exc())
 
+
 @app.get("/teams/search")
 async def search_teams(q: str):
     try:
@@ -68,6 +127,7 @@ async def search_teams(q: str):
         return {"teams": teams}
     except Exception:
         raise HTTPException(status_code=500, detail=traceback.format_exc())
+
 
 @app.post("/analyze")
 async def analyze_match(req: AnalyzeRequest):
@@ -91,32 +151,29 @@ async def analyze_match(req: AnalyzeRequest):
         raise HTTPException(status_code=500, detail=traceback.format_exc())
 
 
-# ─── NEW: Today's matches + auto predictions ───
 @app.get("/today")
 async def get_today_predictions():
-    """Get all today's matches with AI predictions, auto-saved"""
+    """Get all today's matches with AI predictions — cached in DB"""
     try:
         today = date.today().isoformat()
-        store = load_predictions()
 
         # Return cached if already generated today
-        if today in store and store[today].get("predictions"):
+        cached = db.get_predictions(today)
+        if cached:
+            accuracy = db.get_accuracy(today)
             return {
                 "date": today,
-                "predictions": store[today]["predictions"],
-                "accuracy": store[today].get("accuracy"),
-                "cached": True
+                "predictions": cached,
+                "accuracy": accuracy,
+                "cached": True,
             }
 
         # Fetch today's matches
-        try:
-            matches = await sport_api.get_todays_matches()
-        except Exception as e:
-            matches = []
+        matches = await sport_api.get_todays_matches()
         if not matches:
             return {"date": today, "predictions": [], "accuracy": None, "message": "No matches today"}
 
-        # Run predictions for each match
+        # Run AI predictions for each match
         predictions = []
         for m in matches:
             try:
@@ -132,7 +189,7 @@ async def get_today_predictions():
                     home_team_id=m["home_team"]["id"],
                     away_team_id=m["away_team"]["id"],
                 )
-                predictions.append({
+                prediction = {
                     "match_id": str(m["match_id"]),
                     "home_team": m["home_team"]["name"],
                     "away_team": m["away_team"]["name"],
@@ -145,21 +202,14 @@ async def get_today_predictions():
                     "decision": result["decision"],
                     "decision_type": result["decision_type"],
                     "predicted_score": f"{result['predicted_home_goals']}-{result['predicted_away_goals']}",
-                    "actual_result": None,  # filled later
+                    "actual_result": None,
                     "correct": None,
-                })
+                }
+                predictions.append(prediction)
+                db.save_prediction(today, prediction)
             except Exception:
                 continue
 
-        # Save to store
-        store[today] = {
-            "predictions": predictions,
-            "accuracy": None,
-            "generated_at": datetime.utcnow().isoformat()
-        }
-        save_predictions(store)
-
-        # Build recommendations
         recs = analyzer.build_recommendations(predictions)
 
         return {
@@ -167,7 +217,7 @@ async def get_today_predictions():
             "predictions": predictions,
             "recommendations": recs,
             "accuracy": None,
-            "cached": False
+            "cached": False,
         }
 
     except Exception:
@@ -176,17 +226,12 @@ async def get_today_predictions():
 
 @app.get("/today/recommendations")
 async def get_recommendations():
-    """Get today's top picks: solid bets + value bets (against the odds)"""
+    """Get today's top picks: solid bets + value bets"""
     try:
         today = date.today().isoformat()
-        store = load_predictions()
-
-        predictions = []
-        if today in store:
-            predictions = store[today].get("predictions", [])
+        predictions = db.get_predictions(today)
 
         if not predictions:
-            # Auto-generate
             resp = await get_today_predictions()
             predictions = resp.get("predictions", [])
 
@@ -199,65 +244,104 @@ async def get_recommendations():
 
 @app.post("/results/update")
 async def update_result(req: UpdateResultRequest):
-    """Update actual result for a match and recalculate accuracy"""
+    """Manually update actual result for a match"""
     try:
         today = date.today().isoformat()
-        store = load_predictions()
+        predictions = db.get_predictions(today)
 
-        if today not in store:
+        if not predictions:
             raise HTTPException(status_code=404, detail="No predictions for today")
 
-        predictions = store[today]["predictions"]
-        updated = False
-
-        for p in predictions:
-            if p["match_id"] == req.match_id:
-                hg = req.actual_home_goals
-                ag = req.actual_away_goals
-                p["actual_result"] = f"{hg}-{ag}"
-
-                # Check if prediction was correct
-                if hg > ag:
-                    actual_outcome = "home"
-                elif ag > hg:
-                    actual_outcome = "away"
-                else:
-                    actual_outcome = "draw"
-
-                predicted_outcome = (
-                    "home" if p["home_win_prob"] > p["away_win_prob"] and p["home_win_prob"] > p["draw_prob"]
-                    else "away" if p["away_win_prob"] > p["home_win_prob"] and p["away_win_prob"] > p["draw_prob"]
-                    else "draw"
-                )
-                p["correct"] = (actual_outcome == predicted_outcome)
-                updated = True
-                break
-
-        if not updated:
+        match = next((p for p in predictions if p["match_id"] == req.match_id), None)
+        if not match:
             raise HTTPException(status_code=404, detail="Match not found")
 
-        # Recalculate accuracy
-        completed = [p for p in predictions if p["correct"] is not None]
-        if completed:
-            correct_count = sum(1 for p in completed if p["correct"])
-            accuracy = round(correct_count / len(completed) * 100, 1)
-            store[today]["accuracy"] = {
-                "percentage": accuracy,
-                "correct": correct_count,
-                "total": len(completed),
-                "updated_at": datetime.utcnow().isoformat()
-            }
+        hg = req.actual_home_goals
+        ag = req.actual_away_goals
+        actual_result = f"{hg}-{ag}"
 
-        store[today]["predictions"] = predictions
-        save_predictions(store)
+        if hg > ag:
+            actual_outcome = "home"
+        elif ag > hg:
+            actual_outcome = "away"
+        else:
+            actual_outcome = "draw"
 
-        return {
-            "success": True,
-            "accuracy": store[today].get("accuracy")
-        }
+        hw = match["home_win_prob"]
+        aw = match["away_win_prob"]
+        dw = match["draw_prob"]
+        if hw >= aw and hw >= dw:
+            predicted_outcome = "home"
+        elif aw >= hw and aw >= dw:
+            predicted_outcome = "away"
+        else:
+            predicted_outcome = "draw"
+
+        correct = (actual_outcome == predicted_outcome)
+        db.update_match_result(req.match_id, today, actual_result, correct)
+        accuracy = db.recalculate_accuracy(today)
+
+        return {"success": True, "accuracy": accuracy}
 
     except HTTPException:
         raise
+    except Exception:
+        raise HTTPException(status_code=500, detail=traceback.format_exc())
+
+
+@app.post("/results/auto-update")
+async def auto_update_today():
+    """Manually trigger auto-update of today's results"""
+    try:
+        today = date.today().isoformat()
+        predictions = db.get_predictions(today)
+        if not predictions:
+            return {"message": "No predictions for today"}
+
+        finished = await sport_api.get_finished_matches(today)
+        finished_map = {f["match_id"]: f for f in finished}
+
+        updated_count = 0
+        for p in predictions:
+            if p["correct"] is not None:
+                continue
+            result = finished_map.get(p["match_id"])
+            if not result:
+                continue
+
+            hg = result["home_goals"]
+            ag = result["away_goals"]
+            actual_result = f"{hg}-{ag}"
+
+            if hg > ag:
+                actual_outcome = "home"
+            elif ag > hg:
+                actual_outcome = "away"
+            else:
+                actual_outcome = "draw"
+
+            hw = p["home_win_prob"]
+            aw = p["away_win_prob"]
+            dw = p["draw_prob"]
+            if hw >= aw and hw >= dw:
+                predicted_outcome = "home"
+            elif aw >= hw and aw >= dw:
+                predicted_outcome = "away"
+            else:
+                predicted_outcome = "draw"
+
+            correct = (actual_outcome == predicted_outcome)
+            db.update_match_result(p["match_id"], today, actual_result, correct)
+            updated_count += 1
+
+        accuracy = db.recalculate_accuracy(today) if updated_count > 0 else db.get_accuracy(today)
+
+        return {
+            "updated": updated_count,
+            "finished_found": len(finished),
+            "accuracy": accuracy,
+        }
+
     except Exception:
         raise HTTPException(status_code=500, detail=traceback.format_exc())
 
@@ -266,16 +350,17 @@ async def update_result(req: UpdateResultRequest):
 async def get_accuracy_history():
     """Get accuracy stats for all past days"""
     try:
-        store = load_predictions()
-        history = []
-        for day, data in sorted(store.items(), reverse=True):
-            acc = data.get("accuracy")
-            total = len(data.get("predictions", []))
-            history.append({
-                "date": day,
-                "accuracy": acc,
-                "total_predictions": total,
-            })
+        history = db.get_accuracy_history()
         return {"history": history}
+    except Exception:
+        raise HTTPException(status_code=500, detail=traceback.format_exc())
+
+
+@app.get("/accuracy/stats")
+async def get_overall_stats():
+    """Get overall accuracy statistics"""
+    try:
+        stats = db.get_overall_stats()
+        return stats
     except Exception:
         raise HTTPException(status_code=500, detail=traceback.format_exc())

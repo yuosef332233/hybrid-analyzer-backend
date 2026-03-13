@@ -1,6 +1,7 @@
 def form_to_score(form: list) -> float:
     return sum(20 if r == "W" else 10 if r == "D" else 0 for r in form)
 
+
 def compute_rating(stats: dict) -> float:
     if not stats:
         return 65.0
@@ -8,8 +9,15 @@ def compute_rating(stats: dict) -> float:
     ga = stats.get("goals_against_avg", 1.2)
     w = stats.get("wins", 0)
     l = stats.get("losses", 0)
-    rating = 65 + (gf - ga) * 10 + (w - l) * 3
+    d = stats.get("draws", 0)
+
+    # Bonus: season-level stats (from SFI) are more reliable
+    source = stats.get("source", "")
+    source_bonus = 2 if source == "merged" else 0
+
+    rating = 65 + (gf - ga) * 10 + (w - l) * 3 + source_bonus
     return round(min(95, max(40, rating)), 1)
+
 
 def auto_context(stats: dict, team_name: str, is_home: bool) -> dict:
     if not stats:
@@ -74,7 +82,67 @@ def auto_context(stats: dict, team_name: str, is_home: bool) -> dict:
         mod -= 3
         factors.append({"icon": "😬", "label": f"Vulnerable defense — {ga} goals conceded avg", "impact": -3, "type": "negative"})
 
+    # Bonus: dual-source data = more accurate context
+    if stats.get("source") == "merged":
+        mod += 2
+
     return {"mod": mod, "factors": factors}
+
+
+def analyze_h2h(h2h_fixtures: list, home_team_id: int, away_team_id: int) -> dict:
+    """Analyze head-to-head history"""
+    if not h2h_fixtures:
+        return {"mod": 0, "home_wins": 0, "away_wins": 0, "draws": 0, "total": 0}
+
+    home_wins = 0
+    away_wins = 0
+    draws = 0
+
+    for m in h2h_fixtures:
+        goals = m.get("goals", {})
+        hg = goals.get("home", 0) or 0
+        ag = goals.get("away", 0) or 0
+        teams = m.get("teams", {})
+        match_home_id = teams.get("home", {}).get("id")
+
+        # Determine if our home team was home or away in this H2H match
+        if match_home_id == home_team_id:
+            if hg > ag:
+                home_wins += 1
+            elif ag > hg:
+                away_wins += 1
+            else:
+                draws += 1
+        else:
+            if ag > hg:
+                home_wins += 1
+            elif hg > ag:
+                away_wins += 1
+            else:
+                draws += 1
+
+    total = home_wins + away_wins + draws
+    if total == 0:
+        return {"mod": 0, "home_wins": 0, "away_wins": 0, "draws": 0, "total": 0}
+
+    # Calculate H2H modifier
+    mod = 0
+    if home_wins / total >= 0.6:
+        mod += 6
+    elif away_wins / total >= 0.6:
+        mod -= 6
+    elif home_wins > away_wins:
+        mod += 3
+    elif away_wins > home_wins:
+        mod -= 3
+
+    return {
+        "mod": mod,
+        "home_wins": home_wins,
+        "away_wins": away_wins,
+        "draws": draws,
+        "total": total,
+    }
 
 
 def run_analysis(home_stats, away_stats, h2h_fixtures,
@@ -83,8 +151,8 @@ def run_analysis(home_stats, away_stats, h2h_fixtures,
                  home_context: str = "",
                  away_context: str = "") -> dict:
 
-    home_form = home_stats.get("form", ["D","D","D","D","D"]) if home_stats else ["D","D","D","D","D"]
-    away_form = away_stats.get("form", ["D","D","D","D","D"]) if away_stats else ["D","D","D","D","D"]
+    home_form = home_stats.get("form", ["D", "D", "D", "D", "D"]) if home_stats else ["D", "D", "D", "D", "D"]
+    away_form = away_stats.get("form", ["D", "D", "D", "D", "D"]) if away_stats else ["D", "D", "D", "D", "D"]
 
     home_rating = compute_rating(home_stats)
     away_rating = compute_rating(away_stats)
@@ -95,11 +163,16 @@ def run_analysis(home_stats, away_stats, h2h_fixtures,
     home_ctx = auto_context(home_stats, "home", is_home=True)
     away_ctx = auto_context(away_stats, "away", is_home=False)
 
+    # H2H analysis
+    h2h_analysis = analyze_h2h(h2h_fixtures, home_team_id, away_team_id)
+    h2h_mod = h2h_analysis["mod"]
+
     home_ctx_mod = home_ctx["mod"]
     away_ctx_mod = away_ctx["mod"]
 
-    home_score = (home_rating * 0.45) + (home_momentum * 0.35) + home_ctx_mod
-    away_score = (away_rating * 0.45) + (away_momentum * 0.35) + away_ctx_mod
+    # Score calculation — now includes H2H
+    home_score = (home_rating * 0.40) + (home_momentum * 0.30) + home_ctx_mod + h2h_mod
+    away_score = (away_rating * 0.40) + (away_momentum * 0.30) + away_ctx_mod
 
     total = home_score + away_score
     home_win = max(15, min(72, (home_score / total) * 100))
@@ -112,7 +185,13 @@ def run_analysis(home_stats, away_stats, h2h_fixtures,
     draw = 100 - home_win - away_win
 
     gap = abs(home_score - away_score)
-    confidence = round(min(91, max(38, 50 + gap * 1.2)))
+
+    # Higher confidence when we have dual-source data
+    data_bonus = 5 if (
+        home_stats and home_stats.get("source") == "merged" and
+        away_stats and away_stats.get("source") == "merged"
+    ) else 0
+    confidence = round(min(93, max(38, 50 + gap * 1.2 + data_bonus)))
 
     if home_win >= 52 and confidence >= 62:
         decision, dtype = "SOLID (1)", "solid"
@@ -139,6 +218,21 @@ def run_analysis(home_stats, away_stats, h2h_fixtures,
     for f in away_ctx["factors"]:
         context_factors.append({**f, "team": "away"})
 
+    # Add H2H factor if significant
+    if h2h_analysis["total"] >= 3:
+        if h2h_mod > 0:
+            context_factors.append({
+                "icon": "📊", "team": "home",
+                "label": f"H2H dominance — {h2h_analysis['home_wins']}W/{h2h_analysis['draws']}D/{h2h_analysis['away_wins']}L in last {h2h_analysis['total']}",
+                "impact": h2h_mod, "type": "positive"
+            })
+        elif h2h_mod < 0:
+            context_factors.append({
+                "icon": "📊", "team": "away",
+                "label": f"H2H advantage — {h2h_analysis['away_wins']}W/{h2h_analysis['draws']}D/{h2h_analysis['home_wins']}L in last {h2h_analysis['total']}",
+                "impact": h2h_mod, "type": "negative"
+            })
+
     return {
         "home_win_prob": home_win,
         "draw_prob": draw,
@@ -153,40 +247,32 @@ def run_analysis(home_stats, away_stats, h2h_fixtures,
         "predicted_home_goals": home_goals,
         "predicted_away_goals": away_goals,
         "context_factors": context_factors,
+        "h2h": h2h_analysis,
+        "data_source": home_stats.get("source", "unknown") if home_stats else "none",
     }
 
 
 def build_recommendations(predictions: list) -> dict:
-    """
-    Build two recommendation lists from today's predictions:
-    1. solid_picks — top 5 most confident predictions
-    2. value_picks — top 5 'against the tide' (underdog likely to win)
-    """
+    """Build solid picks + value picks from today's predictions"""
     if not predictions:
         return {"solid_picks": [], "value_picks": []}
 
-    # ── Solid picks: high confidence + clear winner ──
+    # ── Solid picks ──
     solid = []
     for p in predictions:
         conf = p.get("confidence", 0)
         hw = p.get("home_win_prob", 0)
         aw = p.get("away_win_prob", 0)
         dw = p.get("draw_prob", 0)
-
         max_prob = max(hw, aw, dw)
+
         if conf >= 65 and max_prob >= 50:
             if hw == max_prob:
-                pick = p["home_team"]
-                outcome = "Win"
-                prob = hw
+                pick, outcome, prob = p["home_team"], "Win", hw
             elif aw == max_prob:
-                pick = p["away_team"]
-                outcome = "Win"
-                prob = aw
+                pick, outcome, prob = p["away_team"], "Win", aw
             else:
-                pick = "Draw"
-                outcome = "Draw"
-                prob = dw
+                pick, outcome, prob = "Draw", "Draw", dw
 
             solid.append({
                 "match": f"{p['home_team']} vs {p['away_team']}",
@@ -197,24 +283,21 @@ def build_recommendations(predictions: list) -> dict:
                 "confidence": conf,
                 "kickoff": p.get("kickoff", ""),
                 "predicted_score": p.get("predicted_score", ""),
+                "reason": f"AI confidence {conf}% — {pick} at {prob}% probability",
             })
 
-    # Sort by confidence desc, take top 5
     solid = sorted(solid, key=lambda x: x["confidence"], reverse=True)[:5]
 
-    # ── Value picks: underdog has higher AI probability than expected ──
-    # "Against the tide" = away team wins but home_win_prob > away_win_prob
-    # OR home_win_prob is low but AI still picks home
+    # ── Value picks (upset potential) ──
     value = []
     for p in predictions:
         hw = p.get("home_win_prob", 0)
         aw = p.get("away_win_prob", 0)
         conf = p.get("confidence", 0)
 
-        # Away underdog: away_win_prob surprisingly high (>=35%) but lower than home
         if aw >= 35 and hw > aw and conf >= 55:
             gap = hw - aw
-            if gap <= 20:  # Close gap = real upset potential
+            if gap <= 20:
                 value.append({
                     "match": f"{p['home_team']} vs {p['away_team']}",
                     "league": p.get("league", ""),
@@ -226,8 +309,6 @@ def build_recommendations(predictions: list) -> dict:
                     "reason": f"AI gives {p['away_team']} {aw}% despite being away — gap only {gap}%",
                     "predicted_score": p.get("predicted_score", ""),
                 })
-
-        # Home underdog: home team has surprisingly low prob but AI still sees value
         elif hw >= 30 and aw > hw and conf >= 55:
             gap = aw - hw
             if gap <= 18:
@@ -243,10 +324,6 @@ def build_recommendations(predictions: list) -> dict:
                     "predicted_score": p.get("predicted_score", ""),
                 })
 
-    # Sort by probability desc, take top 5
     value = sorted(value, key=lambda x: x["probability"], reverse=True)[:5]
 
-    return {
-        "solid_picks": solid,
-        "value_picks": value,
-    }
+    return {"solid_picks": solid, "value_picks": value}
