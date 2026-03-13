@@ -262,3 +262,32 @@ async def get_overall_stats():
         return db.get_overall_stats()
     except Exception:
         raise HTTPException(status_code=500, detail=traceback.format_exc())
+
+
+@app.post("/learn")
+async def trigger_learning():
+    """Manually trigger learning from past predictions"""
+    try:
+        result = analyzer.learn_from_history()
+        return result
+    except Exception:
+        raise HTTPException(status_code=500, detail=traceback.format_exc())
+
+
+@app.get("/learn/weights")
+async def get_current_weights():
+    """Get current AI weights"""
+    try:
+        weights = db.get_weights()
+        return {"weights": weights, "default": db.DEFAULT_WEIGHTS}
+    except Exception:
+        raise HTTPException(status_code=500, detail=traceback.format_exc())
+
+
+@app.get("/learn/history")
+async def get_learning_history():
+    """Get history of all learning sessions"""
+    try:
+        return {"history": db.get_learning_history()}
+    except Exception:
+        raise HTTPException(status_code=500, detail=traceback.format_exc())

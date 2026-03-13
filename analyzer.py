@@ -1,3 +1,5 @@
+import db as _db
+
 def form_to_score(form: list) -> float:
     return sum(20 if r == "W" else 10 if r == "D" else 0 for r in form)
 
@@ -14,7 +16,7 @@ def compute_rating(stats: dict) -> float:
     return round(min(95, max(40, rating)), 1)
 
 
-def auto_context(stats: dict, team_name: str, is_home: bool) -> dict:
+def auto_context(stats: dict, team_name: str, is_home: bool, weights: dict) -> dict:
     if not stats:
         return {"mod": 0, "factors": []}
 
@@ -25,9 +27,10 @@ def auto_context(stats: dict, team_name: str, is_home: bool) -> dict:
     mod = 0
     factors = []
 
+    home_adv = weights.get("home_advantage", 5.0)
     if is_home:
-        mod += 5
-        factors.append({"icon": "🏟️", "label": "Home ground advantage", "impact": 5, "type": "positive"})
+        mod += home_adv
+        factors.append({"icon": "🏟️", "label": "Home ground advantage", "impact": home_adv, "type": "positive"})
 
     recent = form[-5:] if len(form) >= 5 else form
     win_count = recent.count("W")
@@ -86,14 +89,11 @@ def analyze_h2h(h2h_fixtures: list, home_team_id: int, away_team_id: int) -> dic
         return {"mod": 0, "home_wins": 0, "away_wins": 0, "draws": 0, "total": 0}
 
     home_wins = away_wins = draws = 0
-
     for m in h2h_fixtures:
         goals = m.get("goals", {})
         hg = goals.get("home", 0) or 0
         ag = goals.get("away", 0) or 0
-        teams = m.get("teams", {})
-        match_home_id = teams.get("home", {}).get("id")
-
+        match_home_id = m.get("teams", {}).get("home", {}).get("id")
         if match_home_id == home_team_id:
             if hg > ag: home_wins += 1
             elif ag > hg: away_wins += 1
@@ -117,30 +117,19 @@ def analyze_h2h(h2h_fixtures: list, home_team_id: int, away_team_id: int) -> dic
 
 
 def predict_score(home_stats, away_stats, home_rating: float, away_rating: float) -> tuple:
-    """
-    Smart score prediction based on actual stats.
-    Uses goals averages + rating difference as weight.
-    No forced results — pure data-driven.
-    """
     gf_home = home_stats.get("goals_for_avg", 1.2) if home_stats else 1.2
     ga_away = away_stats.get("goals_against_avg", 1.2) if away_stats else 1.2
     gf_away = away_stats.get("goals_for_avg", 1.2) if away_stats else 1.2
     ga_home = home_stats.get("goals_against_avg", 1.2) if home_stats else 1.2
 
-    # Expected goals = avg of team attack vs opponent defense
     exp_home = (gf_home + ga_away) / 2
     exp_away = (gf_away + ga_home) / 2
 
-    # Rating difference adds small weight (max ±0.4 goals)
     rating_diff = (home_rating - away_rating) / 100
     exp_home += rating_diff * 0.4
     exp_away -= rating_diff * 0.4
 
-    # Clamp to realistic range
-    home_goals = max(0, min(5, round(exp_home)))
-    away_goals = max(0, min(5, round(exp_away)))
-
-    return home_goals, away_goals
+    return max(0, min(5, round(exp_home))), max(0, min(5, round(exp_away)))
 
 
 def run_analysis(home_stats, away_stats, h2h_fixtures,
@@ -148,6 +137,12 @@ def run_analysis(home_stats, away_stats, h2h_fixtures,
                  away_team_id: int = 0,
                  home_context: str = "",
                  away_context: str = "") -> dict:
+
+    # ── Load learned weights ──
+    try:
+        weights = _db.get_weights()
+    except Exception:
+        weights = _db.DEFAULT_WEIGHTS.copy()
 
     home_form = home_stats.get("form", ["D","D","D","D","D"]) if home_stats else ["D","D","D","D","D"]
     away_form = away_stats.get("form", ["D","D","D","D","D"]) if away_stats else ["D","D","D","D","D"]
@@ -158,14 +153,18 @@ def run_analysis(home_stats, away_stats, h2h_fixtures,
     home_momentum = form_to_score(home_form)
     away_momentum = form_to_score(away_form)
 
-    home_ctx = auto_context(home_stats, "home", is_home=True)
-    away_ctx = auto_context(away_stats, "away", is_home=False)
+    home_ctx = auto_context(home_stats, "home", is_home=True, weights=weights)
+    away_ctx = auto_context(away_stats, "away", is_home=False, weights=weights)
 
     h2h_analysis = analyze_h2h(h2h_fixtures, home_team_id, away_team_id)
     h2h_mod = h2h_analysis["mod"]
 
-    home_score = (home_rating * 0.40) + (home_momentum * 0.30) + home_ctx["mod"] + h2h_mod
-    away_score = (away_rating * 0.40) + (away_momentum * 0.30) + away_ctx["mod"]
+    # ── Use learned weights ──
+    r_w = weights.get("rating_weight", 0.40)
+    f_w = weights.get("form_weight", 0.30)
+
+    home_score = (home_rating * r_w) + (home_momentum * f_w) + home_ctx["mod"] + h2h_mod
+    away_score = (away_rating * r_w) + (away_momentum * f_w) + away_ctx["mod"]
 
     total = home_score + away_score
     home_win = max(15, min(72, (home_score / total) * 100))
@@ -184,18 +183,24 @@ def run_analysis(home_stats, away_stats, h2h_fixtures,
     ) else 0
     confidence = round(min(93, max(38, 50 + gap * 1.2 + data_bonus)))
 
-    if home_win >= 52 and confidence >= 62:
+    # ── Use learned thresholds ──
+    solid1_t = weights.get("solid1_threshold", 52)
+    solid2_t = weights.get("solid2_threshold", 46)
+    conf_min = weights.get("confidence_min", 62)
+    draw_t   = weights.get("draw_threshold", 28)
+    avoid_t  = weights.get("avoid_threshold", 52)
+
+    if home_win >= solid1_t and confidence >= conf_min:
         decision, dtype = "SOLID (1)", "solid"
-    elif away_win >= 46 and confidence >= 60:
+    elif away_win >= solid2_t and confidence >= conf_min:
         decision, dtype = "SOLID (2)", "solid"
-    elif draw >= 28 and abs(home_win - away_win) < 14:
+    elif draw >= draw_t and abs(home_win - away_win) < 14:
         decision, dtype = "VALUE X", "value"
-    elif confidence < 52:
+    elif confidence < avoid_t:
         decision, dtype = "AVOID", "avoid"
     else:
         decision, dtype = "VALUE", "value"
 
-    # ── Smart score — data-driven ──
     home_goals, away_goals = predict_score(home_stats, away_stats, home_rating, away_rating)
 
     context_factors = []
@@ -234,7 +239,107 @@ def run_analysis(home_stats, away_stats, h2h_fixtures,
         "context_factors": context_factors,
         "h2h": h2h_analysis,
         "data_source": home_stats.get("source", "unknown") if home_stats else "none",
+        "weights_version": weights.get("version", 1),
     }
+
+
+def learn_from_history() -> dict:
+    """
+    Analyze past predictions and adjust weights to improve accuracy.
+    Called automatically every night after accuracy is updated.
+    """
+    try:
+        current_weights = _db.get_weights()
+        stats = _db.get_overall_stats()
+        decision_acc = _db.get_decision_accuracy()
+        conf_acc = _db.get_confidence_accuracy()
+
+        total = stats.get("total_predictions", 0)
+        if total < 10:
+            return {"message": "Not enough data yet — need at least 10 predictions", "learned": False}
+
+        overall_acc = stats.get("overall_accuracy", 0)
+        new_weights = current_weights.copy()
+        changes = []
+
+        # ── Learn from decision accuracy ──
+        solid1_acc = decision_acc.get("SOLID (1)", {}).get("accuracy", 50)
+        solid2_acc = decision_acc.get("SOLID (2)", {}).get("accuracy", 50)
+        avoid_acc  = decision_acc.get("AVOID", {}).get("accuracy", 50)
+        draw_acc   = decision_acc.get("VALUE X", {}).get("accuracy", 50)
+
+        # If SOLID (1) accuracy is low → raise threshold (be more selective)
+        if solid1_acc < 55 and decision_acc.get("SOLID (1)", {}).get("total", 0) >= 5:
+            new_weights["solid1_threshold"] = min(60, current_weights["solid1_threshold"] + 1)
+            changes.append(f"SOLID(1) accuracy {solid1_acc}% → raised threshold to {new_weights['solid1_threshold']}")
+
+        # If SOLID (1) accuracy is high → lower threshold slightly (catch more)
+        elif solid1_acc > 72 and decision_acc.get("SOLID (1)", {}).get("total", 0) >= 5:
+            new_weights["solid1_threshold"] = max(48, current_weights["solid1_threshold"] - 1)
+            changes.append(f"SOLID(1) accuracy {solid1_acc}% → lowered threshold to {new_weights['solid1_threshold']}")
+
+        # Same for SOLID (2)
+        if solid2_acc < 50 and decision_acc.get("SOLID (2)", {}).get("total", 0) >= 5:
+            new_weights["solid2_threshold"] = min(55, current_weights["solid2_threshold"] + 1)
+            changes.append(f"SOLID(2) accuracy {solid2_acc}% → raised threshold to {new_weights['solid2_threshold']}")
+        elif solid2_acc > 68 and decision_acc.get("SOLID (2)", {}).get("total", 0) >= 5:
+            new_weights["solid2_threshold"] = max(42, current_weights["solid2_threshold"] - 1)
+            changes.append(f"SOLID(2) accuracy {solid2_acc}% → lowered threshold to {new_weights['solid2_threshold']}")
+
+        # If AVOID accuracy is low → lower the avoid threshold (avoid less, predict more)
+        if avoid_acc < 45 and decision_acc.get("AVOID", {}).get("total", 0) >= 5:
+            new_weights["avoid_threshold"] = max(48, current_weights["avoid_threshold"] - 1)
+            changes.append(f"AVOID accuracy {avoid_acc}% → lowered avoid threshold to {new_weights['avoid_threshold']}")
+        elif avoid_acc > 65:
+            new_weights["avoid_threshold"] = min(58, current_weights["avoid_threshold"] + 1)
+            changes.append(f"AVOID accuracy {avoid_acc}% → raised avoid threshold to {new_weights['avoid_threshold']}")
+
+        # Draw accuracy
+        if draw_acc < 30 and decision_acc.get("VALUE X", {}).get("total", 0) >= 5:
+            new_weights["draw_threshold"] = min(35, current_weights["draw_threshold"] + 1)
+            changes.append(f"Draw accuracy {draw_acc}% → raised draw threshold to {new_weights['draw_threshold']}")
+        elif draw_acc > 50 and decision_acc.get("VALUE X", {}).get("total", 0) >= 5:
+            new_weights["draw_threshold"] = max(22, current_weights["draw_threshold"] - 1)
+            changes.append(f"Draw accuracy {draw_acc}% → lowered draw threshold to {new_weights['draw_threshold']}")
+
+        # ── Learn from confidence buckets ──
+        for bucket in conf_acc:
+            b = bucket.get("bucket")
+            b_total = bucket.get("total", 0)
+            b_correct = bucket.get("correct_count", 0)
+            b_acc = round(b_correct / b_total * 100, 1) if b_total > 0 else 0
+
+            # If high confidence predictions are wrong often → raise confidence minimum
+            if b == "high" and b_acc < 50 and b_total >= 5:
+                new_weights["confidence_min"] = min(70, current_weights["confidence_min"] + 1)
+                changes.append(f"High confidence bucket accuracy {b_acc}% → raised conf_min to {new_weights['confidence_min']}")
+            elif b == "high" and b_acc > 70 and b_total >= 5:
+                new_weights["confidence_min"] = max(58, current_weights["confidence_min"] - 1)
+                changes.append(f"High confidence bucket accuracy {b_acc}% → lowered conf_min to {new_weights['confidence_min']}")
+
+        if not changes:
+            return {
+                "message": "No adjustments needed — current weights performing well",
+                "learned": False,
+                "overall_accuracy": overall_acc,
+                "weights_version": current_weights.get("version", 1),
+            }
+
+        # Save new weights
+        _db.save_weights(new_weights, overall_acc, total, changes)
+
+        return {
+            "message": f"Learned {len(changes)} adjustments",
+            "learned": True,
+            "changes": changes,
+            "overall_accuracy": overall_acc,
+            "old_weights": current_weights,
+            "new_weights": new_weights,
+            "weights_version": new_weights.get("version", 1),
+        }
+
+    except Exception as e:
+        return {"message": f"Learning error: {str(e)}", "learned": False}
 
 
 def build_recommendations(predictions: list) -> dict:
@@ -250,21 +355,15 @@ def build_recommendations(predictions: list) -> dict:
         max_prob = max(hw, aw, dw)
 
         if conf >= 65 and max_prob >= 50:
-            if hw == max_prob:
-                pick, outcome, prob = p["home_team"], "Win", hw
-            elif aw == max_prob:
-                pick, outcome, prob = p["away_team"], "Win", aw
-            else:
-                pick, outcome, prob = "Draw", "Draw", dw
+            if hw == max_prob: pick, outcome, prob = p["home_team"], "Win", hw
+            elif aw == max_prob: pick, outcome, prob = p["away_team"], "Win", aw
+            else: pick, outcome, prob = "Draw", "Draw", dw
 
             solid.append({
                 "match": f"{p['home_team']} vs {p['away_team']}",
                 "league": p.get("league", ""),
-                "pick": pick,
-                "outcome": outcome,
-                "probability": prob,
-                "confidence": conf,
-                "kickoff": p.get("kickoff", ""),
+                "pick": pick, "outcome": outcome, "probability": prob,
+                "confidence": conf, "kickoff": p.get("kickoff", ""),
                 "predicted_score": p.get("predicted_score", ""),
                 "reason": f"AI confidence {conf}% — {pick} at {prob}% probability",
             })
@@ -283,10 +382,8 @@ def build_recommendations(predictions: list) -> dict:
                 value.append({
                     "match": f"{p['home_team']} vs {p['away_team']}",
                     "league": p.get("league", ""),
-                    "pick": p["away_team"],
-                    "outcome": "Upset Win",
-                    "probability": aw,
-                    "confidence": conf,
+                    "pick": p["away_team"], "outcome": "Upset Win",
+                    "probability": aw, "confidence": conf,
                     "kickoff": p.get("kickoff", ""),
                     "reason": f"AI gives {p['away_team']} {aw}% despite being away — gap only {gap}%",
                     "predicted_score": p.get("predicted_score", ""),
@@ -297,15 +394,12 @@ def build_recommendations(predictions: list) -> dict:
                 value.append({
                     "match": f"{p['home_team']} vs {p['away_team']}",
                     "league": p.get("league", ""),
-                    "pick": p["home_team"],
-                    "outcome": "Home Upset",
-                    "probability": hw,
-                    "confidence": conf,
+                    "pick": p["home_team"], "outcome": "Home Upset",
+                    "probability": hw, "confidence": conf,
                     "kickoff": p.get("kickoff", ""),
                     "reason": f"AI gives {p['home_team']} {hw}% at home despite being underdogs — gap only {gap}%",
                     "predicted_score": p.get("predicted_score", ""),
                 })
 
     value = sorted(value, key=lambda x: x["probability"], reverse=True)[:5]
-
     return {"solid_picks": solid, "value_picks": value}
