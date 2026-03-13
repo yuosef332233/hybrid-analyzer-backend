@@ -90,7 +90,6 @@ async def _get_teams_sportmonks(league_id: int, season: int) -> list:
         return []
     try:
         async with httpx.AsyncClient(timeout=15) as client:
-            # Get current season teams
             r = await client.get(
                 f"{SM_URL}/teams",
                 params={
@@ -103,11 +102,13 @@ async def _get_teams_sportmonks(league_id: int, season: int) -> list:
                 data = r.json()
                 teams = []
                 for t in data.get("data", []):
-                    teams.append({
-                        "id": t["id"],
-                        "name": t.get("name", "") or t.get("short_code", ""),
-                        "source": "sportmonks",
-                    })
+                    name = t.get("name") or t.get("short_code", "")
+                    if t.get("id") and name:
+                        teams.append({
+                            "id": t["id"],
+                            "name": name,
+                            "source": "sportmonks",
+                        })
                 return teams
     except Exception:
         pass
@@ -176,10 +177,10 @@ async def search_teams(query: str, league_id: int = 0) -> list:
     if SM_KEY:
         try:
             async with httpx.AsyncClient(timeout=10) as client:
-                params = {"api_token": SM_KEY, "filters": f"name:{query}"}
-                if league_id and SM_LEAGUE_MAP.get(league_id):
-                    params["filters"] += f";leagueId:{SM_LEAGUE_MAP[league_id]}"
-                r = await client.get(f"{SM_URL}/teams/search/{query}", params={"api_token": SM_KEY})
+                r = await client.get(
+                    f"{SM_URL}/teams/search/{query}",
+                    params={"api_token": SM_KEY},
+                )
                 if r.status_code == 200:
                     for t in r.json().get("data", [])[:8]:
                         tid = t.get("id")
