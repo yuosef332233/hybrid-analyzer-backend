@@ -104,6 +104,8 @@ async def _get_teams_sportmonks(league_id: int, season: int) -> list:
             if r.status_code == 200:
                 teams = []
                 for t in r.json().get("data", []):
+                    if t.get("placeholder"):
+                        continue
                     name = t.get("name") or t.get("short_code", "")
                     if t.get("id") and name:
                         teams.append({
