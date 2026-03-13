@@ -109,9 +109,12 @@ async def get_today_predictions():
             }
 
         # Fetch today's matches
-        matches = await sport_api.get_todays_matches()
+        try:
+            matches = await sport_api.get_todays_matches()
+        except Exception as e:
+            matches = []
         if not matches:
-            return {"date": today, "predictions": [], "accuracy": None}
+            return {"date": today, "predictions": [], "accuracy": None, "message": "No matches today"}
 
         # Run predictions for each match
         predictions = []
