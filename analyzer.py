@@ -9,12 +9,7 @@ def compute_rating(stats: dict) -> float:
     ga = stats.get("goals_against_avg", 1.2)
     w = stats.get("wins", 0)
     l = stats.get("losses", 0)
-    d = stats.get("draws", 0)
-
-    # Bonus: season-level stats (from SFI) are more reliable
-    source = stats.get("source", "")
-    source_bonus = 2 if source == "merged" else 0
-
+    source_bonus = 2 if stats.get("source") == "merged" else 0
     rating = 65 + (gf - ga) * 10 + (w - l) * 3 + source_bonus
     return round(min(95, max(40, rating)), 1)
 
@@ -26,8 +21,6 @@ def auto_context(stats: dict, team_name: str, is_home: bool) -> dict:
     form = stats.get("form", [])
     gf = stats.get("goals_for_avg", 1.2)
     ga = stats.get("goals_against_avg", 1.2)
-    wins = stats.get("wins", 0)
-    losses = stats.get("losses", 0)
 
     mod = 0
     factors = []
@@ -82,7 +75,6 @@ def auto_context(stats: dict, team_name: str, is_home: bool) -> dict:
         mod -= 3
         factors.append({"icon": "😬", "label": f"Vulnerable defense — {ga} goals conceded avg", "impact": -3, "type": "negative"})
 
-    # Bonus: dual-source data = more accurate context
     if stats.get("source") == "merged":
         mod += 2
 
@@ -90,13 +82,10 @@ def auto_context(stats: dict, team_name: str, is_home: bool) -> dict:
 
 
 def analyze_h2h(h2h_fixtures: list, home_team_id: int, away_team_id: int) -> dict:
-    """Analyze head-to-head history"""
     if not h2h_fixtures:
         return {"mod": 0, "home_wins": 0, "away_wins": 0, "draws": 0, "total": 0}
 
-    home_wins = 0
-    away_wins = 0
-    draws = 0
+    home_wins = away_wins = draws = 0
 
     for m in h2h_fixtures:
         goals = m.get("goals", {})
@@ -105,44 +94,53 @@ def analyze_h2h(h2h_fixtures: list, home_team_id: int, away_team_id: int) -> dic
         teams = m.get("teams", {})
         match_home_id = teams.get("home", {}).get("id")
 
-        # Determine if our home team was home or away in this H2H match
         if match_home_id == home_team_id:
-            if hg > ag:
-                home_wins += 1
-            elif ag > hg:
-                away_wins += 1
-            else:
-                draws += 1
+            if hg > ag: home_wins += 1
+            elif ag > hg: away_wins += 1
+            else: draws += 1
         else:
-            if ag > hg:
-                home_wins += 1
-            elif hg > ag:
-                away_wins += 1
-            else:
-                draws += 1
+            if ag > hg: home_wins += 1
+            elif hg > ag: away_wins += 1
+            else: draws += 1
 
     total = home_wins + away_wins + draws
     if total == 0:
         return {"mod": 0, "home_wins": 0, "away_wins": 0, "draws": 0, "total": 0}
 
-    # Calculate H2H modifier
     mod = 0
-    if home_wins / total >= 0.6:
-        mod += 6
-    elif away_wins / total >= 0.6:
-        mod -= 6
-    elif home_wins > away_wins:
-        mod += 3
-    elif away_wins > home_wins:
-        mod -= 3
+    if home_wins / total >= 0.6: mod += 6
+    elif away_wins / total >= 0.6: mod -= 6
+    elif home_wins > away_wins: mod += 3
+    elif away_wins > home_wins: mod -= 3
 
-    return {
-        "mod": mod,
-        "home_wins": home_wins,
-        "away_wins": away_wins,
-        "draws": draws,
-        "total": total,
-    }
+    return {"mod": mod, "home_wins": home_wins, "away_wins": away_wins, "draws": draws, "total": total}
+
+
+def predict_score(home_stats, away_stats, home_rating: float, away_rating: float) -> tuple:
+    """
+    Smart score prediction based on actual stats.
+    Uses goals averages + rating difference as weight.
+    No forced results — pure data-driven.
+    """
+    gf_home = home_stats.get("goals_for_avg", 1.2) if home_stats else 1.2
+    ga_away = away_stats.get("goals_against_avg", 1.2) if away_stats else 1.2
+    gf_away = away_stats.get("goals_for_avg", 1.2) if away_stats else 1.2
+    ga_home = home_stats.get("goals_against_avg", 1.2) if home_stats else 1.2
+
+    # Expected goals = avg of team attack vs opponent defense
+    exp_home = (gf_home + ga_away) / 2
+    exp_away = (gf_away + ga_home) / 2
+
+    # Rating difference adds small weight (max ±0.4 goals)
+    rating_diff = (home_rating - away_rating) / 100
+    exp_home += rating_diff * 0.4
+    exp_away -= rating_diff * 0.4
+
+    # Clamp to realistic range
+    home_goals = max(0, min(5, round(exp_home)))
+    away_goals = max(0, min(5, round(exp_away)))
+
+    return home_goals, away_goals
 
 
 def run_analysis(home_stats, away_stats, h2h_fixtures,
@@ -151,8 +149,8 @@ def run_analysis(home_stats, away_stats, h2h_fixtures,
                  home_context: str = "",
                  away_context: str = "") -> dict:
 
-    home_form = home_stats.get("form", ["D", "D", "D", "D", "D"]) if home_stats else ["D", "D", "D", "D", "D"]
-    away_form = away_stats.get("form", ["D", "D", "D", "D", "D"]) if away_stats else ["D", "D", "D", "D", "D"]
+    home_form = home_stats.get("form", ["D","D","D","D","D"]) if home_stats else ["D","D","D","D","D"]
+    away_form = away_stats.get("form", ["D","D","D","D","D"]) if away_stats else ["D","D","D","D","D"]
 
     home_rating = compute_rating(home_stats)
     away_rating = compute_rating(away_stats)
@@ -163,16 +161,11 @@ def run_analysis(home_stats, away_stats, h2h_fixtures,
     home_ctx = auto_context(home_stats, "home", is_home=True)
     away_ctx = auto_context(away_stats, "away", is_home=False)
 
-    # H2H analysis
     h2h_analysis = analyze_h2h(h2h_fixtures, home_team_id, away_team_id)
     h2h_mod = h2h_analysis["mod"]
 
-    home_ctx_mod = home_ctx["mod"]
-    away_ctx_mod = away_ctx["mod"]
-
-    # Score calculation — now includes H2H
-    home_score = (home_rating * 0.40) + (home_momentum * 0.30) + home_ctx_mod + h2h_mod
-    away_score = (away_rating * 0.40) + (away_momentum * 0.30) + away_ctx_mod
+    home_score = (home_rating * 0.40) + (home_momentum * 0.30) + home_ctx["mod"] + h2h_mod
+    away_score = (away_rating * 0.40) + (away_momentum * 0.30) + away_ctx["mod"]
 
     total = home_score + away_score
     home_win = max(15, min(72, (home_score / total) * 100))
@@ -185,8 +178,6 @@ def run_analysis(home_stats, away_stats, h2h_fixtures,
     draw = 100 - home_win - away_win
 
     gap = abs(home_score - away_score)
-
-    # Higher confidence when we have dual-source data
     data_bonus = 5 if (
         home_stats and home_stats.get("source") == "merged" and
         away_stats and away_stats.get("source") == "merged"
@@ -204,13 +195,8 @@ def run_analysis(home_stats, away_stats, h2h_fixtures,
     else:
         decision, dtype = "VALUE", "value"
 
-    gf_home = home_stats.get("goals_for_avg", 1.2) if home_stats else 1.2
-    ga_away = away_stats.get("goals_against_avg", 1.2) if away_stats else 1.2
-    gf_away = away_stats.get("goals_for_avg", 1.2) if away_stats else 1.2
-    ga_home = home_stats.get("goals_against_avg", 1.2) if home_stats else 1.2
-
-    home_goals = max(0, min(4, round((gf_home + ga_away) / 2)))
-    away_goals = max(0, min(4, round((gf_away + ga_home) / 2 - 0.3)))
+    # ── Smart score — data-driven ──
+    home_goals, away_goals = predict_score(home_stats, away_stats, home_rating, away_rating)
 
     context_factors = []
     for f in home_ctx["factors"]:
@@ -218,7 +204,6 @@ def run_analysis(home_stats, away_stats, h2h_fixtures,
     for f in away_ctx["factors"]:
         context_factors.append({**f, "team": "away"})
 
-    # Add H2H factor if significant
     if h2h_analysis["total"] >= 3:
         if h2h_mod > 0:
             context_factors.append({
@@ -253,11 +238,9 @@ def run_analysis(home_stats, away_stats, h2h_fixtures,
 
 
 def build_recommendations(predictions: list) -> dict:
-    """Build solid picks + value picks from today's predictions"""
     if not predictions:
         return {"solid_picks": [], "value_picks": []}
 
-    # ── Solid picks ──
     solid = []
     for p in predictions:
         conf = p.get("confidence", 0)
@@ -288,7 +271,6 @@ def build_recommendations(predictions: list) -> dict:
 
     solid = sorted(solid, key=lambda x: x["confidence"], reverse=True)[:5]
 
-    # ── Value picks (upset potential) ──
     value = []
     for p in predictions:
         hw = p.get("home_win_prob", 0)
