@@ -64,6 +64,11 @@ SM_LEAGUE_MAP = {
 
 # ── SportMonks current season IDs (verified) ──
 SM_SEASON_MAP = {
+    39: 25583,   # Premier League 2025/26
+    140: 25659,  # La Liga 2025/26
+    135: 25533,  # Serie A 2025/26
+    78: 25646,   # Bundesliga 2025/26
+    61: 25651,   # Ligue 1 2025/26
     2: 25580,    # Champions League 2025/26
     3: 25582,    # Europa League 2025/26
     848: 25581,  # Conference League 2025/26
