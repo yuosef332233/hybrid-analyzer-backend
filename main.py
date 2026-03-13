@@ -10,7 +10,7 @@ import sport_api
 import analyzer
 import db
 
-app = FastAPI(title="Hybrid Intelligence Analyzer API", version="3.1.0")
+app = FastAPI(title="Hybrid Intelligence Analyzer API", version="3.2.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -80,7 +80,7 @@ async def startup():
 
 @app.get("/")
 def root():
-    return {"status": "Hybrid Intelligence Analyzer API is running ✅ v3.1"}
+    return {"status": "Hybrid Intelligence Analyzer API is running ✅ v3.2"}
 
 
 @app.get("/teams")
