@@ -227,8 +227,7 @@ async def _get_form(team_id: int) -> dict:
                 f"{SM_URL}/fixtures/between/{from_date}/{today}/{team_id}",
                 params=_params(
                     include="scores;participants",
-                    per_page=10,
-                    sort="-starting_at",
+                    per_page=30,
                 ),
             )
             if r.status_code != 200:
@@ -237,10 +236,12 @@ async def _get_form(team_id: int) -> dict:
             form = []
             gf_total = ga_total = wins = draws = losses = 0
 
-            # Only finished fixtures (state_id 5,6,7)
-            fixtures = [f for f in r.json().get("data", []) if f.get("state_id") in (5, 6, 7)]
+            # Only finished fixtures, sort by date descending in Python (API ignores sort param)
+            all_fixtures = [f for f in r.json().get("data", []) if f.get("state_id") in (5, 6, 7)]
+            all_fixtures.sort(key=lambda x: x.get("starting_at", ""), reverse=True)
+            fixtures = all_fixtures[:5]
 
-            for f in fixtures[:5]:
+            for f in fixtures:
                 participants = f.get("participants", [])
                 home_p = next((p for p in participants if p.get("meta", {}).get("location") == "home"), None)
                 away_p = next((p for p in participants if p.get("meta", {}).get("location") == "away"), None)
