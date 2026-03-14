@@ -1,6 +1,6 @@
 import httpx
 import os
-from datetime import date
+from datetime import date, timedelta
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -50,6 +50,7 @@ SEASON_TO_OURS = {v: k for k, v in SM_SEASON_MAP.items()}
 # In-memory cache
 _teams_cache = {}
 _standings_cache = {}
+_form_cache = {}
 
 
 def _params(**kwargs):
@@ -58,13 +59,10 @@ def _params(**kwargs):
 
 def _extract_scores(scores: list, home_id: int, away_id: int) -> tuple:
     """
-    Extract home/away goals from SportMonks scores array.
-    Format: each score has participant_id + score.goals + description
+    Extract final home/away goals from SportMonks scores array.
+    Each score: {participant_id, score: {goals}, description}
     Priority: CURRENT > 2ND_HALF > 1ST_HALF
     """
-    ft_home = ft_away = None
-
-    # Priority order
     for desc in ("CURRENT", "2ND_HALF", "1ST_HALF"):
         h = a = None
         for s in scores:
@@ -77,10 +75,8 @@ def _extract_scores(scores: list, home_id: int, away_id: int) -> tuple:
             elif pid == away_id:
                 a = goals
         if h is not None and a is not None:
-            ft_home, ft_away = h, a
-            break
-
-    return ft_home or 0, ft_away or 0
+            return h, a
+    return 0, 0
 
 
 # ══════════════════════════════════════════
@@ -213,16 +209,23 @@ async def _load_standings(league_id: int) -> dict:
 
 
 # ══════════════════════════════════════════
-#  TEAM STATS
+#  TEAM STATS — form via fixtures/between
 # ══════════════════════════════════════════
 
-async def _get_form(team_id: int, season_id: int) -> dict:
+async def _get_form(team_id: int) -> dict:
+    """Get last 5 finished matches for a team using fixtures/between endpoint"""
+    if team_id in _form_cache:
+        return _form_cache[team_id]
+
+    today = date.today().isoformat()
+    # Look back 6 months to get enough matches
+    from_date = (date.today() - timedelta(days=180)).isoformat()
+
     try:
         async with httpx.AsyncClient(timeout=15) as client:
             r = await client.get(
-                f"{SM_URL}/fixtures",
+                f"{SM_URL}/fixtures/between/{from_date}/{today}/{team_id}",
                 params=_params(
-                    filters=f"fixtureSeasons:{season_id};fixtureParticipants:{team_id}",
                     include="scores;participants",
                     per_page=10,
                     sort="-starting_at",
@@ -234,7 +237,7 @@ async def _get_form(team_id: int, season_id: int) -> dict:
             form = []
             gf_total = ga_total = wins = draws = losses = 0
 
-            # Only finished fixtures
+            # Only finished fixtures (state_id 5,6,7)
             fixtures = [f for f in r.json().get("data", []) if f.get("state_id") in (5, 6, 7)]
 
             for f in fixtures[:5]:
@@ -266,7 +269,7 @@ async def _get_form(team_id: int, season_id: int) -> dict:
                 return {}
 
             played = wins + draws + losses or 1
-            return {
+            result = {
                 "form": form,
                 "wins": wins,
                 "draws": draws,
@@ -275,16 +278,17 @@ async def _get_form(team_id: int, season_id: int) -> dict:
                 "goals_against_avg": round(ga_total / played, 2),
                 "source": "sportmonks",
             }
+            _form_cache[team_id] = result
+            return result
+
     except Exception:
         return {}
 
 
 async def get_team_stats(team_id: int, league_id: int, season: int) -> dict:
-    season_id = SM_SEASON_MAP.get(league_id)
-
     standings = await _load_standings(league_id)
     standing_stats = standings.get(team_id, {})
-    form_stats = await _get_form(team_id, season_id) if season_id else {}
+    form_stats = await _get_form(team_id)
 
     if standing_stats and form_stats:
         return {
