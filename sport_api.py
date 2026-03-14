@@ -218,8 +218,8 @@ async def _get_form(team_id: int) -> dict:
         return _form_cache[team_id]
 
     today = date.today().isoformat()
-    # Look back 6 months to get enough matches
-    from_date = (date.today() - timedelta(days=180)).isoformat()
+    # Look back 3 months — enough for 5 matches for any team
+    from_date = (date.today() - timedelta(days=90)).isoformat()
 
     try:
         async with httpx.AsyncClient(timeout=15) as client:
@@ -227,7 +227,7 @@ async def _get_form(team_id: int) -> dict:
                 f"{SM_URL}/fixtures/between/{from_date}/{today}/{team_id}",
                 params=_params(
                     include="scores;participants",
-                    per_page=30,
+                    per_page=50,
                 ),
             )
             if r.status_code != 200:
