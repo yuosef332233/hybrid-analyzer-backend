@@ -26,7 +26,7 @@ SM_SEASON_MAP = {
     66: 25652,   # Coupe de France
 }
 
-# SportMonks league_id → our league_id (from real API response)
+# SportMonks league_id → our league_id
 SM_LEAGUE_TO_OURS = {
     8: 39,     # Premier League
     564: 140,  # La Liga
@@ -44,7 +44,7 @@ SM_LEAGUE_TO_OURS = {
     182: 66,   # Coupe de France
 }
 
-# Reverse: season_id → our league_id (backup)
+# Reverse: season_id → our league_id
 SEASON_TO_OURS = {v: k for k, v in SM_SEASON_MAP.items()}
 
 # In-memory cache
@@ -54,6 +54,33 @@ _standings_cache = {}
 
 def _params(**kwargs):
     return {"api_token": SM_KEY, **kwargs}
+
+
+def _extract_scores(scores: list, home_id: int, away_id: int) -> tuple:
+    """
+    Extract home/away goals from SportMonks scores array.
+    Format: each score has participant_id + score.goals + description
+    Priority: CURRENT > 2ND_HALF > 1ST_HALF
+    """
+    ft_home = ft_away = None
+
+    # Priority order
+    for desc in ("CURRENT", "2ND_HALF", "1ST_HALF"):
+        h = a = None
+        for s in scores:
+            if s.get("description") != desc:
+                continue
+            pid = s.get("participant_id")
+            goals = s.get("score", {}).get("goals", 0) or 0
+            if pid == home_id:
+                h = goals
+            elif pid == away_id:
+                a = goals
+        if h is not None and a is not None:
+            ft_home, ft_away = h, a
+            break
+
+    return ft_home or 0, ft_away or 0
 
 
 # ══════════════════════════════════════════
@@ -206,26 +233,22 @@ async def _get_form(team_id: int, season_id: int) -> dict:
 
             form = []
             gf_total = ga_total = wins = draws = losses = 0
+
+            # Only finished fixtures
             fixtures = [f for f in r.json().get("data", []) if f.get("state_id") in (5, 6, 7)]
 
             for f in fixtures[:5]:
                 participants = f.get("participants", [])
                 home_p = next((p for p in participants if p.get("meta", {}).get("location") == "home"), None)
-                is_home = home_p and home_p["id"] == team_id
+                away_p = next((p for p in participants if p.get("meta", {}).get("location") == "away"), None)
+                if not home_p or not away_p:
+                    continue
 
-                ft_home = ft_away = 0
-                for s in f.get("scores", []):
-                    if s.get("description") in ("CURRENT", "FT", "2ND_HALF"):
-                        score_data = s.get("score", {})
-                        for p in participants:
-                            pid = str(p["id"])
-                            loc = p.get("meta", {}).get("location")
-                            g = score_data.get(pid, {})
-                            goals = g.get("goals", 0) if isinstance(g, dict) else 0
-                            if loc == "home":
-                                ft_home = goals
-                            else:
-                                ft_away = goals
+                home_id = home_p["id"]
+                away_id = away_p["id"]
+                is_home = home_id == team_id
+
+                ft_home, ft_away = _extract_scores(f.get("scores", []), home_id, away_id)
 
                 gf = ft_home if is_home else ft_away
                 ga = ft_away if is_home else ft_home
@@ -298,19 +321,9 @@ async def get_h2h(team1_id: int, team2_id: int, last: int = 10) -> list:
                     if not home_p or not away_p:
                         continue
 
-                    ft_home = ft_away = 0
-                    for s in f.get("scores", []):
-                        if s.get("description") in ("CURRENT", "FT", "2ND_HALF"):
-                            score_data = s.get("score", {})
-                            for p in participants:
-                                pid = str(p["id"])
-                                loc = p.get("meta", {}).get("location")
-                                g = score_data.get(pid, {})
-                                goals = g.get("goals", 0) if isinstance(g, dict) else 0
-                                if loc == "home":
-                                    ft_home = goals
-                                else:
-                                    ft_away = goals
+                    ft_home, ft_away = _extract_scores(
+                        f.get("scores", []), home_p["id"], away_p["id"]
+                    )
 
                     h2h.append({
                         "match_id": f.get("id"),
@@ -346,25 +359,20 @@ async def get_todays_matches() -> list:
                     if mid in seen_ids:
                         continue
 
-                    # Try league_id first, then season_id as fallback
                     sm_league_id = f.get("league_id")
                     our_league_id = SM_LEAGUE_TO_OURS.get(sm_league_id, 0)
                     if our_league_id == 0:
-                        season_id = f.get("season_id")
-                        our_league_id = SEASON_TO_OURS.get(season_id, 0)
-
+                        our_league_id = SEASON_TO_OURS.get(f.get("season_id"), 0)
                     if our_league_id == 0:
                         continue
 
                     state_id = f.get("state_id")
-                    # Skip finished/cancelled
                     if state_id in (5, 6, 7, 10):
                         continue
 
                     participants = f.get("participants", [])
                     home = next((p for p in participants if p.get("meta", {}).get("location") == "home"), None)
                     away = next((p for p in participants if p.get("meta", {}).get("location") == "away"), None)
-
                     if not home or not away:
                         continue
 
@@ -413,23 +421,14 @@ async def get_finished_matches(target_date: str) -> list:
                         continue
 
                     participants = f.get("participants", [])
-                    ft_home = ft_away = None
-
-                    for s in f.get("scores", []):
-                        if s.get("description") in ("CURRENT", "FT", "2ND_HALF"):
-                            score_data = s.get("score", {})
-                            for p in participants:
-                                pid = str(p["id"])
-                                loc = p.get("meta", {}).get("location")
-                                g = score_data.get(pid, {})
-                                goals = g.get("goals", 0) if isinstance(g, dict) else 0
-                                if loc == "home":
-                                    ft_home = goals
-                                elif loc == "away":
-                                    ft_away = goals
-
-                    if ft_home is None or ft_away is None:
+                    home_p = next((p for p in participants if p.get("meta", {}).get("location") == "home"), None)
+                    away_p = next((p for p in participants if p.get("meta", {}).get("location") == "away"), None)
+                    if not home_p or not away_p:
                         continue
+
+                    ft_home, ft_away = _extract_scores(
+                        f.get("scores", []), home_p["id"], away_p["id"]
+                    )
 
                     finished.append({
                         "match_id": str(f.get("id", "")),
