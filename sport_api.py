@@ -26,7 +26,25 @@ SM_SEASON_MAP = {
     66: 25652,   # Coupe de France
 }
 
-# Reverse: season_id → our league_id
+# SportMonks league_id → our league_id (from real API response)
+SM_LEAGUE_TO_OURS = {
+    8: 39,     # Premier League
+    564: 140,  # La Liga
+    384: 135,  # Serie A
+    82: 78,    # Bundesliga
+    301: 61,   # Ligue 1
+    2: 2,      # Champions League
+    5: 3,      # Europa League
+    72: 848,   # Conference League
+    24: 45,    # FA Cup
+    25: 48,    # League Cup
+    238: 143,  # Copa del Rey
+    65: 137,   # Coppa Italia
+    38: 81,    # DFB Pokal
+    182: 66,   # Coupe de France
+}
+
+# Reverse: season_id → our league_id (backup)
 SEASON_TO_OURS = {v: k for k, v in SM_SEASON_MAP.items()}
 
 # In-memory cache
@@ -188,7 +206,6 @@ async def _get_form(team_id: int, season_id: int) -> dict:
 
             form = []
             gf_total = ga_total = wins = draws = losses = 0
-
             fixtures = [f for f in r.json().get("data", []) if f.get("state_id") in (5, 6, 7)]
 
             for f in fixtures[:5]:
@@ -198,16 +215,13 @@ async def _get_form(team_id: int, season_id: int) -> dict:
 
                 ft_home = ft_away = 0
                 for s in f.get("scores", []):
-                    if s.get("description") in ("CURRENT", "FT"):
+                    if s.get("description") in ("CURRENT", "FT", "2ND_HALF"):
                         score_data = s.get("score", {})
                         for p in participants:
-                            pid = p["id"]
+                            pid = str(p["id"])
                             loc = p.get("meta", {}).get("location")
-                            g = score_data.get(str(pid), {})
-                            if isinstance(g, dict):
-                                goals = g.get("goals", 0) or 0
-                            else:
-                                goals = 0
+                            g = score_data.get(pid, {})
+                            goals = g.get("goals", 0) if isinstance(g, dict) else 0
                             if loc == "home":
                                 ft_home = goals
                             else:
@@ -247,7 +261,6 @@ async def get_team_stats(team_id: int, league_id: int, season: int) -> dict:
 
     standings = await _load_standings(league_id)
     standing_stats = standings.get(team_id, {})
-
     form_stats = await _get_form(team_id, season_id) if season_id else {}
 
     if standing_stats and form_stats:
@@ -287,7 +300,7 @@ async def get_h2h(team1_id: int, team2_id: int, last: int = 10) -> list:
 
                     ft_home = ft_away = 0
                     for s in f.get("scores", []):
-                        if s.get("description") in ("CURRENT", "FT"):
+                        if s.get("description") in ("CURRENT", "FT", "2ND_HALF"):
                             score_data = s.get("score", {})
                             for p in participants:
                                 pid = str(p["id"])
@@ -321,8 +334,6 @@ async def get_todays_matches() -> list:
     all_matches = []
     seen_ids = set()
 
-    supported_seasons = set(SM_SEASON_MAP.values())
-
     try:
         async with httpx.AsyncClient(timeout=30) as client:
             r = await client.get(
@@ -335,8 +346,13 @@ async def get_todays_matches() -> list:
                     if mid in seen_ids:
                         continue
 
-                    season_id = f.get("season_id")
-                    our_league_id = SEASON_TO_OURS.get(season_id, 0)
+                    # Try league_id first, then season_id as fallback
+                    sm_league_id = f.get("league_id")
+                    our_league_id = SM_LEAGUE_TO_OURS.get(sm_league_id, 0)
+                    if our_league_id == 0:
+                        season_id = f.get("season_id")
+                        our_league_id = SEASON_TO_OURS.get(season_id, 0)
+
                     if our_league_id == 0:
                         continue
 
@@ -378,8 +394,6 @@ async def get_todays_matches() -> list:
 
 async def get_finished_matches(target_date: str) -> list:
     finished = []
-    supported_seasons = set(SM_SEASON_MAP.values())
-
     try:
         async with httpx.AsyncClient(timeout=30) as client:
             r = await client.get(
@@ -390,14 +404,19 @@ async def get_finished_matches(target_date: str) -> list:
                 for f in r.json().get("data", []):
                     if f.get("state_id") not in (5, 6, 7):
                         continue
-                    if f.get("season_id") not in supported_seasons:
+
+                    sm_league_id = f.get("league_id")
+                    our_league_id = SM_LEAGUE_TO_OURS.get(sm_league_id, 0)
+                    if our_league_id == 0:
+                        our_league_id = SEASON_TO_OURS.get(f.get("season_id"), 0)
+                    if our_league_id == 0:
                         continue
 
                     participants = f.get("participants", [])
                     ft_home = ft_away = None
 
                     for s in f.get("scores", []):
-                        if s.get("description") in ("CURRENT", "FT"):
+                        if s.get("description") in ("CURRENT", "FT", "2ND_HALF"):
                             score_data = s.get("score", {})
                             for p in participants:
                                 pid = str(p["id"])
