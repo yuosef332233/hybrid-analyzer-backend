@@ -8,7 +8,7 @@ load_dotenv()
 SM_KEY = os.getenv("SPORTMONKS_API_KEY")
 SM_URL = "https://api.sportmonks.com/v3/football"
 
-# SportMonks season IDs (2025/26)
+# SportMonks season IDs (2025/26) — club competitions
 SM_SEASON_MAP = {
     39: 25583,   # Premier League
     140: 25659,  # La Liga
@@ -26,7 +26,7 @@ SM_SEASON_MAP = {
     66: 25652,   # Coupe de France
 }
 
-# SportMonks league_id → our league_id
+# SportMonks league_id → our league_id (club competitions)
 SM_LEAGUE_TO_OURS = {
     8: 39,     # Premier League
     564: 140,  # La Liga
@@ -44,6 +44,32 @@ SM_LEAGUE_TO_OURS = {
     182: 66,   # Coupe de France
 }
 
+# International competitions → league_id 999
+# SportMonks league IDs for international
+SM_INTL_LEAGUE_IDS = {
+    1002,   # UEFA Nations League A
+    1003,   # UEFA Nations League B
+    1004,   # UEFA Nations League C
+    1005,   # UEFA Nations League D
+    1006,   # UEFA Euro Qualifiers
+    132,    # World Cup Qualification Europe
+    350,    # World Cup Qualification Asia
+    351,    # World Cup Qualification Africa
+    352,    # World Cup Qualification South America (CONMEBOL)
+    353,    # World Cup Qualification CONCACAF
+    354,    # World Cup Qualification Oceania
+    1009,   # International Friendlies
+    1001,   # UEFA Nations League (general)
+    444,    # UEFA Nations League
+    1160,   # UEFA Nations League A
+    1161,   # UEFA Nations League B
+    1162,   # UEFA Nations League C
+    1163,   # UEFA Nations League D
+}
+
+# Our league_id for international
+INTL_LEAGUE_ID = 999
+
 # Reverse: season_id → our league_id
 SEASON_TO_OURS = {v: k for k, v in SM_SEASON_MAP.items()}
 
@@ -60,7 +86,6 @@ def _params(**kwargs):
 def _extract_scores(scores: list, home_id: int, away_id: int) -> tuple:
     """
     Extract final home/away goals from SportMonks scores array.
-    Each score: {participant_id, score: {goals}, description}
     Priority: CURRENT > 2ND_HALF > 1ST_HALF
     """
     for desc in ("CURRENT", "2ND_HALF", "1ST_HALF"):
@@ -209,16 +234,15 @@ async def _load_standings(league_id: int) -> dict:
 
 
 # ══════════════════════════════════════════
-#  TEAM STATS — form via fixtures/between
+#  TEAM STATS
 # ══════════════════════════════════════════
 
 async def _get_form(team_id: int) -> dict:
-    """Get last 5 finished matches for a team using fixtures/between endpoint"""
+    """Get last 5 finished matches using fixtures/between — sorted by date in Python"""
     if team_id in _form_cache:
         return _form_cache[team_id]
 
     today = date.today().isoformat()
-    # Look back 3 months — enough for 5 matches for any team
     from_date = (date.today() - timedelta(days=90)).isoformat()
 
     try:
@@ -236,8 +260,8 @@ async def _get_form(team_id: int) -> dict:
             form = []
             gf_total = ga_total = wins = draws = losses = 0
 
-            # Only finished fixtures, sort by date descending in Python (API ignores sort param)
             all_fixtures = [f for f in r.json().get("data", []) if f.get("state_id") in (5, 6, 7)]
+            # Sort by date descending in Python (API ignores sort param)
             all_fixtures.sort(key=lambda x: x.get("starting_at", ""), reverse=True)
             fixtures = all_fixtures[:5]
 
@@ -301,7 +325,8 @@ async def get_team_stats(team_id: int, league_id: int, season: int) -> dict:
             "goals_against_avg": round(standing_stats["goals_against_avg"] * 0.6 + form_stats["goals_against_avg"] * 0.4, 2),
             "source": "merged",
         }
-    return standing_stats or form_stats or {}
+    # For international teams — use form only (no standings)
+    return form_stats or standing_stats or {}
 
 
 # ══════════════════════════════════════════
@@ -329,7 +354,6 @@ async def get_h2h(team1_id: int, team2_id: int, last: int = 10) -> list:
                     ft_home, ft_away = _extract_scores(
                         f.get("scores", []), home_p["id"], away_p["id"]
                     )
-
                     h2h.append({
                         "match_id": f.get("id"),
                         "teams": {
@@ -365,9 +389,23 @@ async def get_todays_matches() -> list:
                         continue
 
                     sm_league_id = f.get("league_id")
+
+                    # Check club leagues first
                     our_league_id = SM_LEAGUE_TO_OURS.get(sm_league_id, 0)
                     if our_league_id == 0:
                         our_league_id = SEASON_TO_OURS.get(f.get("season_id"), 0)
+
+                    # Check international leagues
+                    if our_league_id == 0 and sm_league_id in SM_INTL_LEAGUE_IDS:
+                        our_league_id = INTL_LEAGUE_ID
+
+                    # Also accept matches with national teams (type=national)
+                    if our_league_id == 0:
+                        participants = f.get("participants", [])
+                        has_national = any(p.get("type") == "national" for p in participants)
+                        if has_national:
+                            our_league_id = INTL_LEAGUE_ID
+
                     if our_league_id == 0:
                         continue
 
@@ -422,6 +460,12 @@ async def get_finished_matches(target_date: str) -> list:
                     our_league_id = SM_LEAGUE_TO_OURS.get(sm_league_id, 0)
                     if our_league_id == 0:
                         our_league_id = SEASON_TO_OURS.get(f.get("season_id"), 0)
+                    if our_league_id == 0 and sm_league_id in SM_INTL_LEAGUE_IDS:
+                        our_league_id = INTL_LEAGUE_ID
+                    if our_league_id == 0:
+                        participants = f.get("participants", [])
+                        if any(p.get("type") == "national" for p in participants):
+                            our_league_id = INTL_LEAGUE_ID
                     if our_league_id == 0:
                         continue
 
@@ -434,7 +478,6 @@ async def get_finished_matches(target_date: str) -> list:
                     ft_home, ft_away = _extract_scores(
                         f.get("scores", []), home_p["id"], away_p["id"]
                     )
-
                     finished.append({
                         "match_id": str(f.get("id", "")),
                         "home_goals": int(ft_home),

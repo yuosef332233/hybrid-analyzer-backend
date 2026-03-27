@@ -138,7 +138,6 @@ def run_analysis(home_stats, away_stats, h2h_fixtures,
                  home_context: str = "",
                  away_context: str = "") -> dict:
 
-    # ── Load learned weights ──
     try:
         weights = _db.get_weights()
     except Exception:
@@ -149,7 +148,6 @@ def run_analysis(home_stats, away_stats, h2h_fixtures,
 
     home_rating = compute_rating(home_stats)
     away_rating = compute_rating(away_stats)
-
     home_momentum = form_to_score(home_form)
     away_momentum = form_to_score(away_form)
 
@@ -159,7 +157,6 @@ def run_analysis(home_stats, away_stats, h2h_fixtures,
     h2h_analysis = analyze_h2h(h2h_fixtures, home_team_id, away_team_id)
     h2h_mod = h2h_analysis["mod"]
 
-    # ── Use learned weights ──
     r_w = weights.get("rating_weight", 0.40)
     f_w = weights.get("form_weight", 0.30)
 
@@ -183,7 +180,6 @@ def run_analysis(home_stats, away_stats, h2h_fixtures,
     ) else 0
     confidence = round(min(93, max(38, 50 + gap * 1.2 + data_bonus)))
 
-    # ── Use learned thresholds ──
     solid1_t = weights.get("solid1_threshold", 52)
     solid2_t = weights.get("solid2_threshold", 46)
     conf_min = weights.get("confidence_min", 62)
@@ -245,94 +241,118 @@ def run_analysis(home_stats, away_stats, h2h_fixtures,
 
 def learn_from_history() -> dict:
     """
-    Analyze past predictions and adjust weights to improve accuracy.
-    Called automatically every night after accuracy is updated.
+    Careful learning — only adjusts when there's enough data AND a clear signal.
+    Tracks both overall accuracy and tips-specific accuracy.
     """
     try:
         current_weights = _db.get_weights()
         stats = _db.get_overall_stats()
         decision_acc = _db.get_decision_accuracy()
         conf_acc = _db.get_confidence_accuracy()
+        tips_acc = _db.get_tips_accuracy()
 
         total = stats.get("total_predictions", 0)
-        if total < 10:
-            return {"message": "Not enough data yet — need at least 10 predictions", "learned": False}
+        # Need at least 20 predictions before learning
+        if total < 20:
+            return {
+                "message": f"Not enough data yet — need at least 20 predictions (have {total})",
+                "learned": False
+            }
 
         overall_acc = stats.get("overall_accuracy", 0)
         new_weights = current_weights.copy()
         changes = []
 
-        # ── Learn from decision accuracy ──
-        solid1_acc = decision_acc.get("SOLID (1)", {}).get("accuracy", 50)
-        solid2_acc = decision_acc.get("SOLID (2)", {}).get("accuracy", 50)
-        avoid_acc  = decision_acc.get("AVOID", {}).get("accuracy", 50)
-        draw_acc   = decision_acc.get("VALUE X", {}).get("accuracy", 50)
+        # Minimum sample per decision type before adjusting
+        MIN_SAMPLE = 10
 
-        # If SOLID (1) accuracy is low → raise threshold (be more selective)
-        if solid1_acc < 55 and decision_acc.get("SOLID (1)", {}).get("total", 0) >= 5:
-            new_weights["solid1_threshold"] = min(60, current_weights["solid1_threshold"] + 1)
-            changes.append(f"SOLID(1) accuracy {solid1_acc}% → raised threshold to {new_weights['solid1_threshold']}")
+        solid1_data = decision_acc.get("SOLID (1)", {})
+        solid2_data = decision_acc.get("SOLID (2)", {})
+        draw_data   = decision_acc.get("VALUE X", {})
 
-        # If SOLID (1) accuracy is high → lower threshold slightly (catch more)
-        elif solid1_acc > 72 and decision_acc.get("SOLID (1)", {}).get("total", 0) >= 5:
-            new_weights["solid1_threshold"] = max(48, current_weights["solid1_threshold"] - 1)
-            changes.append(f"SOLID(1) accuracy {solid1_acc}% → lowered threshold to {new_weights['solid1_threshold']}")
+        solid1_acc = solid1_data.get("accuracy", 50)
+        solid2_acc = solid2_data.get("accuracy", 50)
+        draw_acc   = draw_data.get("accuracy", 50)
 
-        # Same for SOLID (2)
-        if solid2_acc < 50 and decision_acc.get("SOLID (2)", {}).get("total", 0) >= 5:
-            new_weights["solid2_threshold"] = min(55, current_weights["solid2_threshold"] + 1)
-            changes.append(f"SOLID(2) accuracy {solid2_acc}% → raised threshold to {new_weights['solid2_threshold']}")
-        elif solid2_acc > 68 and decision_acc.get("SOLID (2)", {}).get("total", 0) >= 5:
-            new_weights["solid2_threshold"] = max(42, current_weights["solid2_threshold"] - 1)
-            changes.append(f"SOLID(2) accuracy {solid2_acc}% → lowered threshold to {new_weights['solid2_threshold']}")
+        # ── SOLID (1) ──
+        if solid1_data.get("total", 0) >= MIN_SAMPLE:
+            if solid1_acc < 50:
+                new_t = min(62, current_weights["solid1_threshold"] + 1)
+                if new_t != current_weights["solid1_threshold"]:
+                    new_weights["solid1_threshold"] = new_t
+                    changes.append(f"SOLID(1) accuracy {solid1_acc}% → raised threshold to {new_t}")
+            elif solid1_acc > 75:
+                new_t = max(48, current_weights["solid1_threshold"] - 1)
+                if new_t != current_weights["solid1_threshold"]:
+                    new_weights["solid1_threshold"] = new_t
+                    changes.append(f"SOLID(1) accuracy {solid1_acc}% → lowered threshold to {new_t}")
 
-        # If AVOID accuracy is low → lower the avoid threshold (avoid less, predict more)
-        if avoid_acc < 45 and decision_acc.get("AVOID", {}).get("total", 0) >= 5:
-            new_weights["avoid_threshold"] = max(48, current_weights["avoid_threshold"] - 1)
-            changes.append(f"AVOID accuracy {avoid_acc}% → lowered avoid threshold to {new_weights['avoid_threshold']}")
-        elif avoid_acc > 65:
-            new_weights["avoid_threshold"] = min(58, current_weights["avoid_threshold"] + 1)
-            changes.append(f"AVOID accuracy {avoid_acc}% → raised avoid threshold to {new_weights['avoid_threshold']}")
+        # ── SOLID (2) ──
+        if solid2_data.get("total", 0) >= MIN_SAMPLE:
+            if solid2_acc < 45:
+                new_t = min(58, current_weights["solid2_threshold"] + 1)
+                if new_t != current_weights["solid2_threshold"]:
+                    new_weights["solid2_threshold"] = new_t
+                    changes.append(f"SOLID(2) accuracy {solid2_acc}% → raised threshold to {new_t}")
+            elif solid2_acc > 70:
+                new_t = max(42, current_weights["solid2_threshold"] - 1)
+                if new_t != current_weights["solid2_threshold"]:
+                    new_weights["solid2_threshold"] = new_t
+                    changes.append(f"SOLID(2) accuracy {solid2_acc}% → lowered threshold to {new_t}")
 
-        # Draw accuracy
-        if draw_acc < 30 and decision_acc.get("VALUE X", {}).get("total", 0) >= 5:
-            new_weights["draw_threshold"] = min(35, current_weights["draw_threshold"] + 1)
-            changes.append(f"Draw accuracy {draw_acc}% → raised draw threshold to {new_weights['draw_threshold']}")
-        elif draw_acc > 50 and decision_acc.get("VALUE X", {}).get("total", 0) >= 5:
-            new_weights["draw_threshold"] = max(22, current_weights["draw_threshold"] - 1)
-            changes.append(f"Draw accuracy {draw_acc}% → lowered draw threshold to {new_weights['draw_threshold']}")
+        # ── Draw ──
+        if draw_data.get("total", 0) >= MIN_SAMPLE:
+            if draw_acc < 28:
+                new_t = min(36, current_weights["draw_threshold"] + 1)
+                if new_t != current_weights["draw_threshold"]:
+                    new_weights["draw_threshold"] = new_t
+                    changes.append(f"Draw accuracy {draw_acc}% → raised draw threshold to {new_t}")
+            elif draw_acc > 52:
+                new_t = max(22, current_weights["draw_threshold"] - 1)
+                if new_t != current_weights["draw_threshold"]:
+                    new_weights["draw_threshold"] = new_t
+                    changes.append(f"Draw accuracy {draw_acc}% → lowered draw threshold to {new_t}")
 
-        # ── Learn from confidence buckets ──
+        # ── Confidence buckets ──
         for bucket in conf_acc:
             b = bucket.get("bucket")
             b_total = bucket.get("total", 0)
             b_correct = bucket.get("correct_count", 0)
             b_acc = round(b_correct / b_total * 100, 1) if b_total > 0 else 0
+            if b == "high" and b_total >= MIN_SAMPLE:
+                if b_acc < 45:
+                    new_t = min(72, current_weights["confidence_min"] + 1)
+                    if new_t != current_weights["confidence_min"]:
+                        new_weights["confidence_min"] = new_t
+                        changes.append(f"High confidence accuracy {b_acc}% → raised conf_min to {new_t}")
+                elif b_acc > 72:
+                    new_t = max(58, current_weights["confidence_min"] - 1)
+                    if new_t != current_weights["confidence_min"]:
+                        new_weights["confidence_min"] = new_t
+                        changes.append(f"High confidence accuracy {b_acc}% → lowered conf_min to {new_t}")
 
-            # If high confidence predictions are wrong often → raise confidence minimum
-            if b == "high" and b_acc < 50 and b_total >= 5:
-                new_weights["confidence_min"] = min(70, current_weights["confidence_min"] + 1)
-                changes.append(f"High confidence bucket accuracy {b_acc}% → raised conf_min to {new_weights['confidence_min']}")
-            elif b == "high" and b_acc > 70 and b_total >= 5:
-                new_weights["confidence_min"] = max(58, current_weights["confidence_min"] - 1)
-                changes.append(f"High confidence bucket accuracy {b_acc}% → lowered conf_min to {new_weights['confidence_min']}")
+        # ── Tips-specific accuracy report ──
+        tips_total = tips_acc.get("total", 0)
+        tips_pct = tips_acc.get("accuracy", 0)
+        tips_note = f"Tips accuracy: {tips_pct}% ({tips_total} solid picks evaluated)"
 
         if not changes:
             return {
-                "message": "No adjustments needed — current weights performing well",
+                "message": f"No adjustments needed — weights stable. {tips_note}",
                 "learned": False,
                 "overall_accuracy": overall_acc,
+                "tips_accuracy": tips_pct,
                 "weights_version": current_weights.get("version", 1),
             }
 
-        # Save new weights
         _db.save_weights(new_weights, overall_acc, total, changes)
 
         return {
-            "message": f"Learned {len(changes)} adjustments",
+            "message": f"Learned {len(changes)} adjustments. {tips_note}",
             "learned": True,
             "changes": changes,
             "overall_accuracy": overall_acc,
+            "tips_accuracy": tips_pct,
             "old_weights": current_weights,
             "new_weights": new_weights,
             "weights_version": new_weights.get("version", 1),
@@ -343,9 +363,14 @@ def learn_from_history() -> dict:
 
 
 def build_recommendations(predictions: list) -> dict:
+    """
+    Build solid + value picks.
+    Value picks only shown when there's genuine upset potential — never forced.
+    """
     if not predictions:
         return {"solid_picks": [], "value_picks": []}
 
+    # ── SOLID PICKS ──
     solid = []
     for p in predictions:
         conf = p.get("confidence", 0)
@@ -355,51 +380,68 @@ def build_recommendations(predictions: list) -> dict:
         max_prob = max(hw, aw, dw)
 
         if conf >= 65 and max_prob >= 50:
-            if hw == max_prob: pick, outcome, prob = p["home_team"], "Win", hw
-            elif aw == max_prob: pick, outcome, prob = p["away_team"], "Win", aw
-            else: pick, outcome, prob = "Draw", "Draw", dw
+            if hw == max_prob:
+                pick, outcome, prob = p["home_team"], "Win", hw
+            elif aw == max_prob:
+                pick, outcome, prob = p["away_team"], "Win", aw
+            else:
+                pick, outcome, prob = "Draw", "Draw", dw
 
             solid.append({
                 "match": f"{p['home_team']} vs {p['away_team']}",
                 "league": p.get("league", ""),
-                "pick": pick, "outcome": outcome, "probability": prob,
-                "confidence": conf, "kickoff": p.get("kickoff", ""),
-                "predicted_score": p.get("predicted_score", ""),
+                "pick": pick,
+                "outcome": outcome,
+                "probability": prob,
+                "confidence": conf,
+                "kickoff": p.get("kickoff", ""),
                 "reason": f"AI confidence {conf}% — {pick} at {prob}% probability",
             })
 
     solid = sorted(solid, key=lambda x: x["confidence"], reverse=True)[:5]
 
+    # ── VALUE PICKS — genuine upset potential only ──
+    # Requirements:
+    # - Underdog has real chance (≥ 30%)
+    # - Gap is meaningful but not too large (10-22%)
+    # - Confidence ≥ 55%
     value = []
     for p in predictions:
         hw = p.get("home_win_prob", 0)
         aw = p.get("away_win_prob", 0)
         conf = p.get("confidence", 0)
 
-        if aw >= 35 and hw > aw and conf >= 55:
-            gap = hw - aw
-            if gap <= 20:
-                value.append({
-                    "match": f"{p['home_team']} vs {p['away_team']}",
-                    "league": p.get("league", ""),
-                    "pick": p["away_team"], "outcome": "Upset Win",
-                    "probability": aw, "confidence": conf,
-                    "kickoff": p.get("kickoff", ""),
-                    "reason": f"AI gives {p['away_team']} {aw}% despite being away — gap only {gap}%",
-                    "predicted_score": p.get("predicted_score", ""),
-                })
-        elif hw >= 30 and aw > hw and conf >= 55:
-            gap = aw - hw
-            if gap <= 18:
-                value.append({
-                    "match": f"{p['home_team']} vs {p['away_team']}",
-                    "league": p.get("league", ""),
-                    "pick": p["home_team"], "outcome": "Home Upset",
-                    "probability": hw, "confidence": conf,
-                    "kickoff": p.get("kickoff", ""),
-                    "reason": f"AI gives {p['home_team']} {hw}% at home despite being underdogs — gap only {gap}%",
-                    "predicted_score": p.get("predicted_score", ""),
-                })
+        if conf < 55:
+            continue
+
+        gap = abs(hw - aw)
+        if not (10 <= gap <= 22):
+            continue
+
+        # Away upset
+        if hw > aw and aw >= 30:
+            value.append({
+                "match": f"{p['home_team']} vs {p['away_team']}",
+                "league": p.get("league", ""),
+                "pick": p["away_team"],
+                "outcome": "Upset Win",
+                "probability": aw,
+                "confidence": conf,
+                "kickoff": p.get("kickoff", ""),
+                "reason": f"AI gives {p['away_team']} {aw}% despite being away — gap only {gap}%",
+            })
+        # Home upset
+        elif aw > hw and hw >= 30:
+            value.append({
+                "match": f"{p['home_team']} vs {p['away_team']}",
+                "league": p.get("league", ""),
+                "pick": p["home_team"],
+                "outcome": "Home Upset",
+                "probability": hw,
+                "confidence": conf,
+                "kickoff": p.get("kickoff", ""),
+                "reason": f"AI gives {p['home_team']} {hw}% at home despite being underdogs — gap only {gap}%",
+            })
 
     value = sorted(value, key=lambda x: x["probability"], reverse=True)[:5]
     return {"solid_picks": solid, "value_picks": value}

@@ -8,7 +8,6 @@ from datetime import datetime
 
 DB_PATH = os.getenv("DB_PATH", "predictions.db")
 
-# Default weights — system starts here and learns over time
 DEFAULT_WEIGHTS = {
     "home_advantage": 5.0,
     "form_weight": 0.30,
@@ -29,7 +28,6 @@ def get_conn():
 
 
 def init_db():
-    """Create tables if they don't exist"""
     with get_conn() as conn:
         conn.executescript("""
         CREATE TABLE IF NOT EXISTS predictions (
@@ -186,7 +184,6 @@ def get_overall_stats() -> dict:
 # ══════════════════════════════════════════
 
 def get_weights() -> dict:
-    """Get current learning weights — returns defaults if none saved yet"""
     with get_conn() as conn:
         row = conn.execute(
             "SELECT weights_json FROM learning_weights ORDER BY id DESC LIMIT 1"
@@ -194,7 +191,6 @@ def get_weights() -> dict:
         if row:
             try:
                 w = json.loads(row["weights_json"])
-                # Merge with defaults in case new keys were added
                 merged = {**DEFAULT_WEIGHTS, **w}
                 return merged
             except Exception:
@@ -203,7 +199,6 @@ def get_weights() -> dict:
 
 
 def save_weights(weights: dict, overall_accuracy: float, total_predictions: int, changes: list = None):
-    """Save new learned weights"""
     with get_conn() as conn:
         old_row = conn.execute(
             "SELECT weights_json FROM learning_weights ORDER BY id DESC LIMIT 1"
@@ -236,7 +231,6 @@ def save_weights(weights: dict, overall_accuracy: float, total_predictions: int,
 
 
 def get_learning_history() -> list:
-    """Get history of all learning sessions"""
     with get_conn() as conn:
         rows = conn.execute("""
             SELECT date, accuracy_before, accuracy_after, changes, created_at
@@ -258,7 +252,6 @@ def get_learning_history() -> list:
 # ══════════════════════════════════════════
 
 def get_decision_accuracy() -> dict:
-    """Get accuracy breakdown by decision type — used for learning"""
     with get_conn() as conn:
         rows = conn.execute("""
             SELECT decision_type, decision,
@@ -281,7 +274,6 @@ def get_decision_accuracy() -> dict:
 
 
 def get_confidence_accuracy() -> list:
-    """Get accuracy by confidence bucket — used for learning"""
     with get_conn() as conn:
         rows = conn.execute("""
             SELECT
@@ -298,3 +290,27 @@ def get_confidence_accuracy() -> list:
             GROUP BY bucket
         """).fetchall()
         return [dict(r) for r in rows]
+
+
+def get_tips_accuracy() -> dict:
+    """
+    Get accuracy specifically for tips (SOLID picks shown to users).
+    Solid picks = high confidence predictions we recommended.
+    """
+    with get_conn() as conn:
+        row = conn.execute("""
+            SELECT
+                COUNT(*) as total,
+                SUM(CASE WHEN correct = 1 THEN 1 ELSE 0 END) as correct
+            FROM predictions
+            WHERE correct IS NOT NULL
+              AND decision_type = 'solid'
+              AND confidence >= 65
+        """).fetchone()
+        total = row["total"] or 0
+        correct = row["correct"] or 0
+        return {
+            "total": total,
+            "correct": correct,
+            "accuracy": round(correct / total * 100, 1) if total > 0 else 0,
+        }
