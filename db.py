@@ -314,3 +314,4 @@ def get_tips_accuracy() -> dict:
             "correct": correct,
             "accuracy": round(correct / total * 100, 1) if total > 0 else 0,
         }
+    
